@@ -4,6 +4,12 @@
 #include "tensorflow/core/framework/op_kernel.h"
 #include "tensorflow/core/framework/shape_inference.h"
 
+#include <type_traits>
+
+extern "C" void LaunchMusaTanhGradDouble(const double* y, const double* dy,
+                                         double* dz, int64_t n,
+                                         musaStream_t stream);
+
 namespace tensorflow {
 namespace musa {
 
@@ -23,6 +29,14 @@ class MusaTanhGradOp : public MusaOpKernel {
     OP_REQUIRES_OK(ctx, ctx->allocate_output(0, y.shape(), &dz));
 
     if (y.NumElements() == 0) return;
+
+    if constexpr (std::is_same<T, double>::value) {
+      LaunchMusaTanhGradDouble(y.flat<double>().data(),
+                               dy.flat<double>().data(),
+                               dz->flat<double>().data(), y.NumElements(),
+                               GetMusaStreamByCtx(ctx));
+      return;
+    }
 
     MUSA_OP_REQUIRES_MUDNN_HANDLE(ctx);
     auto& handle = GetHandleByCtx(ctx);

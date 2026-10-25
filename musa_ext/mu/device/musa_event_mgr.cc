@@ -105,24 +105,14 @@ void MusaEventMgr::DestroyEvent(musaEvent_t event) {
 
 void MusaEventMgr::ThenExecute(musaStream_t stream,
                                std::function<void()> func) {
-  ToFreeVector to_free;
-  {
-    mutex_lock l(mu_);
-    QueueFunc(stream, std::move(func));
-    PollEvents(false, &to_free);
-  }
-  FreeMemory(to_free);
+  mutex_lock l(mu_);
+  QueueFunc(stream, std::move(func));
 }
 
 void MusaEventMgr::ThenExecuteWithStatus(musaStream_t stream,
                                          std::function<void(Status)> func) {
-  ToFreeVector to_free;
-  {
-    mutex_lock l(mu_);
-    QueueInUse(stream, {nullptr, nullptr, std::move(func), true});
-    PollEvents(false, &to_free);
-  }
-  FreeMemory(to_free);
+  mutex_lock l(mu_);
+  QueueInUse(stream, {nullptr, nullptr, std::move(func), true});
 }
 
 void MusaEventMgr::QueueInUse(musaStream_t stream, InUse in_use) {

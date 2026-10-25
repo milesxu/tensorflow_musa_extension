@@ -302,6 +302,32 @@ bool IsFusionResidualConst(const NodeDef& node) {
 
 bool IsFullyIsolatedNode(const NodeDef& node) { return node.input_size() == 0; }
 
+bool IsPreservedIsolatedNode(const NodeDef& node) {
+  const char* raw_prefixes =
+      std::getenv("MUSA_PRESERVE_ISOLATED_NODE_PREFIXES");
+  if (raw_prefixes == nullptr || raw_prefixes[0] == '\0') {
+    return false;
+  }
+  const std::string prefixes(raw_prefixes);
+  size_t begin = 0;
+  while (begin <= prefixes.size()) {
+    const size_t end = prefixes.find(',', begin);
+    const std::string prefix =
+        prefixes.substr(begin, end == std::string::npos
+                                   ? std::string::npos
+                                   : end - begin);
+    if (!prefix.empty() &&
+        node.name().compare(0, prefix.size(), prefix) == 0) {
+      return true;
+    }
+    if (end == std::string::npos) {
+      break;
+    }
+    begin = end + 1;
+  }
+  return false;
+}
+
 int RemoveIsolatedNodes(GraphDef* graph) {
   // Fusion may leave behind folded scalar constants that no longer feed any
   // live node. Also drop nodes that are completely disconnected from the
@@ -325,6 +351,9 @@ int RemoveIsolatedNodes(GraphDef* graph) {
       const auto& node = graph->node(i);
       const bool has_consumers =
           referenced_nodes.find(node.name()) != referenced_nodes.end();
+      if (IsPreservedIsolatedNode(node)) {
+        continue;
+      }
       if ((IsFusionResidualConst(node) && !has_consumers) ||
           (IsFullyIsolatedNode(node) && !has_consumers)) {
         isolated_node_indices.push_back(i);
@@ -5798,7 +5827,8 @@ class MusaGraphOptimizer : public CustomGraphOptimizer {
                            "after_tf215_mixed_bf16_sparse_sgd_fusion");
       }
     }
-    if (configs_.optimizer_remove_ios_node != TriState::kOff) {
+    if (configs_.optimizer_remove_ios_node != TriState::kOff &&
+        !EnvFlagEnabledLocal("MUSA_DISABLE_REMOVE_ISOLATED_NODES")) {
       const int removed_isolated_nodes = RemoveIsolatedNodes(optimized_graph);
       if (removed_isolated_nodes > 0) {
         VLOG(1) << "MusaGraphOptimizer: Removed " << removed_isolated_nodes

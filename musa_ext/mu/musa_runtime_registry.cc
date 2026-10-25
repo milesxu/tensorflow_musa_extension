@@ -27,7 +27,12 @@ namespace musa {
 namespace {
 
 std::mutex g_mu;
-std::unordered_map<int32_t, MusaSeDeviceRuntimeState> g_devices;
+// PluggableDevice does not consistently invoke plugin_destroy_device during
+// Python interpreter shutdown. Destroying the MUSA event manager's internal
+// TensorFlow ThreadPool from a library static destructor can race TensorFlow's
+// own global thread-pool teardown and corrupt the glibc heap. Keep this
+// process-lifetime registry alive so the OS performs final cleanup.
+auto* g_devices = new std::unordered_map<int32_t, MusaSeDeviceRuntimeState>();
 
 bool Live(const MusaSeDeviceRuntimeState& s) { return s.ref_count > 0; }
 
@@ -40,7 +45,7 @@ void MaybeFillPciStub(int32_t ordinal, MusaSeDeviceRuntimeState* st) {
 
 void MusaSeRegistryOnDeviceCreated(int32_t ordinal) {
   std::lock_guard<std::mutex> lock(g_mu);
-  MusaSeDeviceRuntimeState& st = g_devices[ordinal];
+  MusaSeDeviceRuntimeState& st = (*g_devices)[ordinal];
   st.ordinal = ordinal;
   ++st.ref_count;
   MaybeFillPciStub(ordinal, &st);
@@ -48,8 +53,8 @@ void MusaSeRegistryOnDeviceCreated(int32_t ordinal) {
 
 void MusaSeRegistryOnDeviceDestroyed(int32_t ordinal) {
   std::lock_guard<std::mutex> lock(g_mu);
-  auto it = g_devices.find(ordinal);
-  if (it == g_devices.end()) {
+  auto it = g_devices->find(ordinal);
+  if (it == g_devices->end()) {
     return;
   }
   if (--(it->second.ref_count) <= 0) {
@@ -58,15 +63,15 @@ void MusaSeRegistryOnDeviceDestroyed(int32_t ordinal) {
     it->second.collective_runtime_opaque.reset();
     it->second.event_mgr.reset();
     it->second.pinned_pool.reset();
-    g_devices.erase(it);
+    g_devices->erase(it);
   }
 }
 
 void MusaSeRegistryOnStreamDestroyed(int32_t ordinal, musaStream_t stream) {
   if (stream == nullptr) return;
   std::lock_guard<std::mutex> lock(g_mu);
-  auto it = g_devices.find(ordinal);
-  if (it == g_devices.end()) return;
+  auto it = g_devices->find(ordinal);
+  if (it == g_devices->end()) return;
   it->second.mudnn_by_stream.erase(reinterpret_cast<uintptr_t>(stream));
 }
 
@@ -79,8 +84,8 @@ void MusaSeRegistryOnStreamDestroyed(int32_t ordinal, musaStream_t stream) {
   const uintptr_t stream_key = reinterpret_cast<uintptr_t>(stream);
 
   std::lock_guard<std::mutex> lock(g_mu);
-  auto it = g_devices.find(ordinal);
-  if (it == g_devices.end() || !Live(it->second)) {
+  auto it = g_devices->find(ordinal);
+  if (it == g_devices->end() || !Live(it->second)) {
     return nullptr;
   }
 
@@ -114,8 +119,8 @@ void MusaSeRegistryOnStreamDestroyed(int32_t ordinal, musaStream_t stream) {
 MusaEventMgr* MusaSeRegistryEventMgr(int32_t ordinal) {
   if (ordinal < 0) return nullptr;
   std::lock_guard<std::mutex> lock(g_mu);
-  auto it = g_devices.find(ordinal);
-  if (it == g_devices.end() || !Live(it->second)) return nullptr;
+  auto it = g_devices->find(ordinal);
+  if (it == g_devices->end() || !Live(it->second)) return nullptr;
   if (!it->second.event_mgr) {
     it->second.event_mgr.reset(new MusaEventMgr(ordinal));
   }
@@ -125,8 +130,8 @@ MusaEventMgr* MusaSeRegistryEventMgr(int32_t ordinal) {
 GPUPinnedMemoryPool* MusaSeRegistryPinnedMemoryPool(int32_t ordinal) {
   if (ordinal < 0) return nullptr;
   std::lock_guard<std::mutex> lock(g_mu);
-  auto it = g_devices.find(ordinal);
-  if (it == g_devices.end() || !Live(it->second)) return nullptr;
+  auto it = g_devices->find(ordinal);
+  if (it == g_devices->end() || !Live(it->second)) return nullptr;
   if (!it->second.pinned_pool) {
     it->second.pinned_pool.reset(new GPUPinnedMemoryPool(ordinal));
   }
@@ -135,26 +140,26 @@ GPUPinnedMemoryPool* MusaSeRegistryPinnedMemoryPool(int32_t ordinal) {
 
 bool MusaSeRegistryHasLiveDeviceForTest(int32_t ordinal) {
   std::lock_guard<std::mutex> lock(g_mu);
-  auto it = g_devices.find(ordinal);
-  if (it == g_devices.end()) return false;
+  auto it = g_devices->find(ordinal);
+  if (it == g_devices->end()) return false;
   return Live(it->second);
 }
 
 std::size_t MusaSeRegistrySizeForTest() {
   std::lock_guard<std::mutex> lock(g_mu);
-  return g_devices.size();
+  return g_devices->size();
 }
 
 std::size_t MusaSeRegistryMudnnSlotCountForTest(int32_t ordinal) {
   std::lock_guard<std::mutex> lock(g_mu);
-  auto it = g_devices.find(ordinal);
-  if (it == g_devices.end()) return 0;
+  auto it = g_devices->find(ordinal);
+  if (it == g_devices->end()) return 0;
   return it->second.mudnn_by_stream.size();
 }
 
 void MusaSeRegistryResetForTest() {
   std::lock_guard<std::mutex> lock(g_mu);
-  g_devices.clear();
+  g_devices->clear();
 }
 
 }  // namespace musa

@@ -70,8 +70,29 @@ class PadOpTest(MUSATestCase):
                    constant_values=3.5)
 
   def testPadNoOp(self):
-    """Pad with zero paddings to trigger the forward-input fast path."""
+    """Pad with zero paddings remains numerically valid."""
     self._test_pad([12, 6], [[0, 0], [0, 0]], tf.float32)
+
+  def testPadDoubleAndInt64(self):
+    """Cover float64 and int64 paths with both padding dtypes."""
+    self._test_pad([5, 7], [[1, 2], [2, 1]], tf.float64,
+                   paddings_dtype=tf.int32, constant_values=1.25)
+    self._test_pad([6, 3], [[2, 0], [0, 4]], tf.int64,
+                   paddings_dtype=tf.int64, constant_values=-7)
+
+  def testPadOneDimensional(self):
+    """Cover the 1D boundary."""
+    self._test_pad([9], [[3, 2]], tf.float32,
+                   paddings_dtype=tf.int64, constant_values=-0.5)
+
+  def testPadRejectsFiveDimensional(self):
+    """The MUSA kernel is intentionally limited to 1-4D input."""
+    x = tf.constant(np.zeros((1, 1, 1, 1, 1), dtype=np.float32))
+    paddings = tf.constant([[0, 0]] * 5, dtype=tf.int32)
+    with tf.device("/device:MUSA:0"):
+      with self.assertRaisesRegex(tf.errors.UnimplementedError,
+                                  "supports 1-4D input"):
+        tf.pad(x, paddings).numpy()
 
   def testPadThreeDimensional(self):
     """Pad a 3D tensor and verify behavior across dimensions."""

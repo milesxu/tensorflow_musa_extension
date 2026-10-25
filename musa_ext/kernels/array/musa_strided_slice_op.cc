@@ -5,6 +5,7 @@
 #include <type_traits>
 
 #include "../utils_op.h"
+#include "musa_strided_slice_double.h"
 #include "tensorflow/core/framework/op_kernel.h"
 #include "tensorflow/core/framework/ops_util.h"
 #include "tensorflow/core/framework/tensor.h"
@@ -140,6 +141,59 @@ class MusaStridedSliceOp : public OpKernel {
       return;
     }
 
+    if constexpr (std::is_same<T, double>::value) {
+      TensorShape proc_tensor_shape;
+      processing_shape.AsTensorShape(&proc_tensor_shape);
+      const int proc_rank = proc_tensor_shape.dims();
+      OP_REQUIRES(context, proc_rank <= 8 && input_dims <= 8,
+                  errors::InvalidArgument(
+                      "MUSA double StridedSlice supports rank <= 8"));
+      OP_REQUIRES(context,
+                  proc_tensor_shape.num_elements() == result->NumElements(),
+                  errors::InvalidArgument(
+                      "MUSA double StridedSlice element count mismatch"));
+
+      StridedSliceDoubleParams params{};
+      params.out_elems = result->NumElements();
+      params.proc_rank = proc_rank;
+      params.input_rank = input_dims;
+      for (int d = 0; d < proc_rank; ++d) {
+        params.proc_dims[d] = proc_tensor_shape.dim_size(d);
+      }
+      int64_t input_stride = 1;
+      for (int d = input_dims - 1; d >= 0; --d) {
+        params.input_strides[d] = input_stride;
+        input_stride *= input.dim_size(d);
+      }
+
+      std::vector<int64_t> m_starts(input_dims, 0);
+      std::vector<int64_t> m_strides(input_dims, 1);
+      for (int i = 0; i < input_dims; ++i) {
+        if (i < static_cast<int>(begin.size())) {
+          int64_t s_begin = static_cast<int64_t>(begin[i]);
+          int64_t s_stride = static_cast<int64_t>(strides[i]);
+          int64_t dim_max = input.dim_size(i);
+          if (s_stride < 0) {
+            if (s_begin >= dim_max) s_begin = dim_max - 1;
+            if (s_begin < 0) s_begin += dim_max;
+          } else {
+            if (s_begin < 0) s_begin = 0;
+            if (s_begin >= dim_max && dim_max > 0) s_begin = dim_max - 1;
+          }
+          m_starts[i] = s_begin;
+          m_strides[i] = s_stride;
+        }
+        params.starts[i] = m_starts[i];
+        params.strides[i] = m_strides[i];
+      }
+      params.new_axis_mask = static_cast<uint32_t>(new_axis_mask_);
+
+      LaunchStridedSliceDouble(input.flat<double>().data(),
+                               result->flat<double>().data(), params,
+                               GetMusaStreamByCtx(context));
+      return;
+    }
+
     auto in_mt = CreateMTensor(input);
     auto out_mt = CreateMTensor(*result);
 
@@ -203,6 +257,7 @@ class MusaStridedSliceOp : public OpKernel {
                           MusaStridedSliceOp<T>)
 
 REGISTER_STRIDED_SLICE_MUSA(float);
+REGISTER_STRIDED_SLICE_MUSA(double);
 REGISTER_STRIDED_SLICE_MUSA(int32);
 REGISTER_STRIDED_SLICE_MUSA(int64);
 REGISTER_STRIDED_SLICE_MUSA(Eigen::half);

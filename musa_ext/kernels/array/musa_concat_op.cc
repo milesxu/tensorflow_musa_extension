@@ -1,5 +1,8 @@
 #include <musa_runtime.h>
 
+#include <cstdint>
+#include <limits>
+#include <type_traits>
 #include <vector>
 
 #include "../utils_op.h"
@@ -27,6 +30,104 @@ void LaunchConcatWithSliceGradBFloat16(const void* slice_grad,
 
 namespace tensorflow {
 namespace musa {
+
+bool SafeMulU64(uint64_t a, uint64_t b, uint64_t* out) {
+  if (a != 0 && b > std::numeric_limits<uint64_t>::max() / a) {
+    return false;
+  }
+  *out = a * b;
+  return true;
+}
+
+template <typename T>
+Status ConcatByDeviceMemcpy(OpKernelContext* ctx,
+                            const std::vector<int>& non_empty_indices,
+                            int axis, int64_t concat_dim_total, Tensor* output,
+                            musaStream_t stream) {
+  const Tensor& ref = ctx->input(non_empty_indices[0]);
+  uint64_t outer = 1;
+  uint64_t inner = 1;
+  for (int d = 0; d < axis; ++d) {
+    if (!SafeMulU64(outer, static_cast<uint64_t>(ref.dim_size(d)), &outer)) {
+      return errors::InvalidArgument("double ConcatV2 outer size overflow");
+    }
+  }
+  for (int d = axis + 1; d < ref.dims(); ++d) {
+    if (!SafeMulU64(inner, static_cast<uint64_t>(ref.dim_size(d)), &inner)) {
+      return errors::InvalidArgument("double ConcatV2 inner size overflow");
+    }
+  }
+  if (outer == 0 || inner == 0) {
+    return errors::InvalidArgument("double ConcatV2 has an empty outer/inner");
+  }
+
+  uint64_t axis_offset = 0;
+  for (int idx : non_empty_indices) {
+    const Tensor& input = ctx->input(idx);
+    const int64_t input_axis = input.dim_size(axis);
+    if (input_axis < 0) {
+      return errors::InvalidArgument("double ConcatV2 has negative axis size");
+    }
+    uint64_t block_bytes = 0;
+    if (!SafeMulU64(static_cast<uint64_t>(input_axis), inner, &block_bytes) ||
+        !SafeMulU64(block_bytes, sizeof(T), &block_bytes)) {
+      return errors::InvalidArgument("double ConcatV2 block size overflow");
+    }
+    if (block_bytes == 0) {
+      axis_offset += static_cast<uint64_t>(input_axis);
+      continue;
+    }
+    const size_t input_bytes = input.TotalBytes();
+    const size_t output_bytes = output->TotalBytes();
+    uint64_t dst_offset_u64 = 0;
+    uint64_t dpitch_u64 = 0;
+    if (!SafeMulU64(axis_offset, inner, &dst_offset_u64) ||
+        !SafeMulU64(dst_offset_u64, sizeof(T), &dst_offset_u64) ||
+        !SafeMulU64(static_cast<uint64_t>(concat_dim_total), inner,
+                    &dpitch_u64) ||
+        !SafeMulU64(dpitch_u64, sizeof(T), &dpitch_u64)) {
+      return errors::InvalidArgument("double ConcatV2 offset/pitch overflow");
+    }
+    if (block_bytes > std::numeric_limits<size_t>::max() ||
+        dst_offset_u64 > std::numeric_limits<size_t>::max() ||
+        dpitch_u64 > std::numeric_limits<size_t>::max() ||
+        outer > std::numeric_limits<size_t>::max()) {
+      return errors::InvalidArgument("double ConcatV2 size exceeds size_t");
+    }
+    const size_t block_bytes_size = static_cast<size_t>(block_bytes);
+    const size_t dst_offset = static_cast<size_t>(dst_offset_u64);
+    const size_t dpitch = static_cast<size_t>(dpitch_u64);
+    if (block_bytes_size > input_bytes || dpitch == 0 ||
+        dpitch > output_bytes || dst_offset > output_bytes ||
+        block_bytes_size > output_bytes - dst_offset) {
+      return errors::InvalidArgument(
+          "double ConcatV2 2D copy exceeds tensor bounds");
+    }
+    const char* src = input.tensor_data().data();
+    char* dst = const_cast<char*>(output->tensor_data().data()) +
+                dst_offset;
+    const size_t spitch = block_bytes_size;
+    musaError_t err;
+    if (outer == 1) {
+      err = musaMemcpyAsync(dst, src, block_bytes_size,
+                            musaMemcpyDeviceToDevice, stream);
+    } else {
+      // One strided copy replaces the previous outer-loop of tiny copies.
+      err = musaMemcpy2DAsync(dst, dpitch, src, spitch, spitch,
+                              static_cast<size_t>(outer),
+                              musaMemcpyDeviceToDevice, stream);
+    }
+    if (err != musaSuccess) {
+      return errors::Internal("double ConcatV2 D2D copy failed: ",
+                              musaGetErrorString(err));
+    }
+    axis_offset += static_cast<uint64_t>(input_axis);
+  }
+  // The copies are ordered on the op's MUSA stream. TensorFlow's stream
+  // dependency and the eventual consumer/fetch provide synchronization, so
+  // blocking the host here only serializes the graph.
+  return OkStatus();
+}
 
 template <typename T, typename Tidx>
 class MusaConcatOp : public MusaOpKernel {
@@ -78,8 +179,6 @@ class MusaConcatOp : public MusaOpKernel {
 
     if (total_elements == 0) return;
 
-    MUSA_OP_REQUIRES_MUDNN_HANDLE(ctx);
-    auto& handle = GetHandleByCtx(ctx);
     musaStream_t stream = GetMusaStreamByCtx(ctx);
     OP_REQUIRES(ctx, stream != nullptr,
                 errors::Internal("MUSA stream is unavailable for Concat"));
@@ -101,6 +200,15 @@ class MusaConcatOp : public MusaOpKernel {
       return;
     }
 
+    if constexpr (std::is_same<T, double>::value) {
+      OP_REQUIRES_OK(
+          ctx, ConcatByDeviceMemcpy<T>(ctx, non_empty_indices, normalized_axis,
+                                       concat_dim_total, output, stream));
+      return;
+    }
+
+    MUSA_OP_REQUIRES_MUDNN_HANDLE(ctx);
+    auto& handle = GetHandleByCtx(ctx);
     std::vector<::musa::dnn::Tensor> mudnn_ins;
     mudnn_ins.reserve(non_empty_indices.size());
     for (int idx : non_empty_indices) {
@@ -254,6 +362,20 @@ REGISTER_KERNEL_BUILDER(Name("ConcatV2")
                             .TypeConstraint<int32>("Tidx")
                             .HostMemory("axis"),
                         MusaConcatOp<int64, int32>);
+
+REGISTER_KERNEL_BUILDER(Name("ConcatV2")
+                            .Device("MUSA")
+                            .TypeConstraint<double>("T")
+                            .TypeConstraint<int32>("Tidx")
+                            .HostMemory("axis"),
+                        MusaConcatOp<double, int32>);
+
+REGISTER_KERNEL_BUILDER(Name("ConcatV2")
+                            .Device("MUSA")
+                            .TypeConstraint<double>("T")
+                            .TypeConstraint<int64>("Tidx")
+                            .HostMemory("axis"),
+                        MusaConcatOp<double, int64>);
 
 REGISTER_KERNEL_BUILDER(Name("MusaConcatWithSliceGrad")
                             .Device("MUSA")

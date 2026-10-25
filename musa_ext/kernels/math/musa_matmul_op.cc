@@ -1,7 +1,11 @@
 #include <mudnn.h>
 #include <mudnn_xmma.h>
 
+#include <mublas.h>
+
 #include <cstdlib>
+#include <limits>
+#include <type_traits>
 
 #include "../utils_op.h"
 #include "tensorflow/core/framework/bfloat16.h"
@@ -14,6 +18,108 @@
 
 namespace tensorflow {
 namespace musa {
+
+Status RunDoubleMatMul(OpKernelContext* ctx, const Tensor& a, const Tensor& b,
+                       int64_t m, int64_t k, int64_t n, bool trans_a,
+                       bool trans_b, const MatMulBCast& bcast, Tensor* out) {
+  if (m < 0 || n < 0 || k < 0 ||
+      m > std::numeric_limits<int>::max() ||
+      n > std::numeric_limits<int>::max() ||
+      k > std::numeric_limits<int>::max()) {
+    return errors::InvalidArgument(
+        "MUSA double MatMul dimensions exceed int range");
+  }
+
+  auto runtime = QueryMusaKernelRuntimeView(ctx);
+  if (runtime.mublas_handle == nullptr) {
+    return errors::Internal("MUSA mublas handle is unavailable");
+  }
+
+  const int64_t out_batch = bcast.output_batch_size();
+  const int64_t x_batch = bcast.x_batch_size();
+  const int64_t y_batch = bcast.y_batch_size();
+  if (out_batch == 0) {
+    return OkStatus();
+  }
+  if (out_batch < 0 || x_batch <= 0 || y_batch <= 0) {
+    return errors::Internal("Invalid MUSA double MatMul batch sizes");
+  }
+  if (out_batch > std::numeric_limits<int>::max()) {
+    return errors::InvalidArgument("BatchMatMulV2 batch is too large");
+  }
+
+  const int64_t a_stride = a.NumElements() / x_batch;
+  const int64_t b_stride = b.NumElements() / y_batch;
+  const int64_t c_stride = out->NumElements() / out_batch;
+  if (a_stride < 0 || b_stride < 0 || c_stride < 0) {
+    return errors::InvalidArgument(
+        "double MatMul has a negative matrix stride");
+  }
+  // m/n/k are range-checked above; lda/ldb/ldc derive only from them.
+  const int lda = static_cast<int>(trans_a ? m : k);
+  const int ldb = static_cast<int>(trans_b ? k : n);
+  const int ldc = static_cast<int>(n);
+  const mublasOperation_t op_first =
+      trans_b ? MUBLAS_OP_T : MUBLAS_OP_N;
+  const mublasOperation_t op_second =
+      trans_a ? MUBLAS_OP_T : MUBLAS_OP_N;
+  const double alpha = 1.0;
+  const double beta = 0.0;
+
+  bool simple_broadcast = true;
+  if (bcast.IsBroadcastingRequired()) {
+    for (int64_t batch = 0; batch < out_batch; ++batch) {
+      const int64_t expected_x = x_batch == 1 ? 0 : batch;
+      const int64_t expected_y = y_batch == 1 ? 0 : batch;
+      if (bcast.x_batch_indices()[batch] != expected_x ||
+          bcast.y_batch_indices()[batch] != expected_y) {
+        simple_broadcast = false;
+        break;
+      }
+    }
+  }
+
+  if (out_batch > 1 && simple_broadcast) {
+    const int64_t strided_a = x_batch == 1 ? 0 : a_stride;
+    const int64_t strided_b = y_batch == 1 ? 0 : b_stride;
+    const mublasStatus_t status = mublasDgemmStridedBatched(
+        runtime.mublas_handle, op_first, op_second, static_cast<int>(n),
+        static_cast<int>(m), static_cast<int>(k), &alpha,
+        b.flat<double>().data(), ldb, static_cast<long long>(strided_b),
+        a.flat<double>().data(), lda, static_cast<long long>(strided_a),
+        &beta, out->flat<double>().data(), ldc,
+        static_cast<long long>(c_stride), static_cast<int>(out_batch));
+    if (status != MUBLAS_STATUS_SUCCESS) {
+      return errors::Internal(
+          "mublasDgemmStridedBatched failed. Status: ",
+          static_cast<int>(status));
+    }
+    return OkStatus();
+  }
+
+  for (int64_t batch = 0; batch < out_batch; ++batch) {
+    const int64_t x_idx =
+        bcast.IsBroadcastingRequired() ? bcast.x_batch_indices()[batch]
+                                       : (x_batch == 1 ? 0 : batch);
+    const int64_t y_idx =
+        bcast.IsBroadcastingRequired() ? bcast.y_batch_indices()[batch]
+                                       : (y_batch == 1 ? 0 : batch);
+    const double* a_ptr = a.flat<double>().data() + x_idx * a_stride;
+    const double* b_ptr = b.flat<double>().data() + y_idx * b_stride;
+    double* c_ptr = out->flat<double>().data() + batch * c_stride;
+
+    const mublasStatus_t status =
+        mublasDgemm(runtime.mublas_handle, op_first, op_second,
+                    static_cast<int>(n), static_cast<int>(m),
+                    static_cast<int>(k), &alpha, b_ptr, ldb, a_ptr, lda,
+                    &beta, c_ptr, ldc);
+    if (status != MUBLAS_STATUS_SUCCESS) {
+      return errors::Internal("MUSA mublasDgemm failed. Status: ",
+                              static_cast<int>(status));
+    }
+  }
+  return OkStatus();
+}
 
 REGISTER_OP("MusaBatchMatMulV2")
     .Input("x: T")
@@ -95,18 +201,25 @@ class MusaMatMulOp : public MusaOpKernel {
     OP_REQUIRES_OK(ctx, ctx->allocate_output(0, out_shape, &out));
     if (out->NumElements() == 0) return;
 
-    MUSA_OP_REQUIRES_MUDNN_HANDLE(ctx);
-    auto& handle = GetHandleByCtx(ctx);
-
     // When inner dim k == 0, inputs have NumElements == 0 but the output
     // (m x n or batch x m x n) is non-empty and must be zero-filled.
     // flat<T>().setZero() is a CPU Eigen op and must NOT be called on device
     // memory — that causes a segfault. Use musaMemsetAsync instead.
     if (in0.NumElements() == 0 || in1.NumElements() == 0) {
-      musaStream_t stream = reinterpret_cast<musaStream_t>(handle.GetStream());
+      musaStream_t stream = GetMusaStreamByCtx(ctx);
       musaMemsetAsync(out->data(), 0, out->TotalBytes(), stream);
       return;
     }
+
+    if constexpr (std::is_same<T, double>::value) {
+      OP_REQUIRES_OK(
+          ctx, RunDoubleMatMul(ctx, in0, in1, m, k, n, trans_a_, trans_b_,
+                               bcast, out));
+      return;
+    }
+
+    MUSA_OP_REQUIRES_MUDNN_HANDLE(ctx);
+    auto& handle = GetHandleByCtx(ctx);
     handle.SetAllowTF32(tf32_enabled_);  // Use TF32 setting from constructor
     mTensor mt_a = CreateMTensor(in0);
     mTensor mt_b = CreateMTensor(in1);

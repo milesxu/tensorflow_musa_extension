@@ -1,7 +1,12 @@
+#include <mublas.h>
+
 #include <cstdlib>
+#include <limits>
+#include <type_traits>
 #include <vector>
 
 #include "../utils_op.h"
+#include "musa_bias_add_double.h"
 #include "tensorflow/core/framework/op_kernel.h"
 #include "tensorflow/core/framework/register_types.h"
 #include "tensorflow/core/framework/tensor.h"
@@ -20,6 +25,55 @@ inline bool ResolveTF32Enabled() {
 }
 
 }  // namespace
+
+Status RunDoubleMatMulBiasAdd(OpKernelContext* ctx, const Tensor& a,
+                              const Tensor& b, const Tensor& bias, int64_t m,
+                              int64_t k, int64_t n, bool transpose_a,
+                              bool transpose_b, Tensor* output) {
+  if (m > std::numeric_limits<int>::max() ||
+      n > std::numeric_limits<int>::max() ||
+      k > std::numeric_limits<int>::max()) {
+    return errors::InvalidArgument(
+        "MUSA double MatMulBiasAdd dimensions exceed int range");
+  }
+
+  auto runtime = QueryMusaKernelRuntimeView(ctx);
+  if (runtime.mublas_handle == nullptr) {
+    return errors::Internal("MUSA mublas handle is unavailable");
+  }
+
+  const int lda = static_cast<int>(transpose_a ? m : k);
+  const int ldb = static_cast<int>(transpose_b ? k : n);
+  const int ldc = static_cast<int>(n);
+  const mublasOperation_t op_first =
+      transpose_b ? MUBLAS_OP_T : MUBLAS_OP_N;
+  const mublasOperation_t op_second =
+      transpose_a ? MUBLAS_OP_T : MUBLAS_OP_N;
+  const double alpha = 1.0;
+  const double beta = 0.0;
+
+  mublasStatus_t status = mublasDgemm(
+      runtime.mublas_handle, op_first, op_second, static_cast<int>(n),
+      static_cast<int>(m), static_cast<int>(k), &alpha,
+      b.flat<double>().data(), ldb, a.flat<double>().data(), lda, &beta,
+      output->flat<double>().data(), ldc);
+  if (status != MUBLAS_STATUS_SUCCESS) {
+    return errors::Internal("MUSA mublasDgemm for MatMulBiasAdd failed. "
+                            "Status: ",
+                            static_cast<int>(status));
+  }
+
+  const double* bias_ptr = bias.flat<double>().data();
+  double* output_ptr = output->flat<double>().data();
+  const musaError_t launch_status =
+      LaunchMusaBiasAddDouble(output_ptr, bias_ptr, m, n, runtime.stream);
+  if (launch_status != musaSuccess) {
+    return errors::Internal("MUSA BiasAddDouble kernel launch failed. "
+                            "Status: ",
+                            static_cast<int>(launch_status));
+  }
+  return OkStatus();
+}
 
 template <typename T>
 class MusaMatMulBiasAddOp : public MusaOpKernel {
@@ -89,6 +143,13 @@ class MusaMatMulBiasAddOp : public MusaOpKernel {
     TensorShape out_shape({m, n});
     Tensor* output = nullptr;
     OP_REQUIRES_OK(ctx, ctx->allocate_output(0, out_shape, &output));
+
+    if constexpr (std::is_same<T, double>::value) {
+      OP_REQUIRES_OK(ctx, RunDoubleMatMulBiasAdd(
+                              ctx, a, b, bias, m, k_a, n, transpose_a_,
+                              transpose_b_, output));
+      return;
+    }
 
     MUSA_OP_REQUIRES_MUDNN_HANDLE(ctx);
     auto& handle = GetHandleByCtx(ctx);
@@ -183,7 +244,7 @@ class MusaMatMulBiasAddOp : public MusaOpKernel {
       MusaMatMulBiasAddOp<TYPE>);
 
 REGISTER_MUSA_MATMUL_BIASADD(float);
-// REGISTER_MUSA_MATMUL_BIASADD(double);
+REGISTER_MUSA_MATMUL_BIASADD(double);
 REGISTER_MUSA_MATMUL_BIASADD(Eigen::half);
 REGISTER_MUSA_MATMUL_BIASADD(bfloat16);
 
@@ -200,7 +261,7 @@ REGISTER_OP("MusaMatMulBiasAdd")
     .Input("b: T")
     .Input("bias: T")
     .Output("product: T")
-    .Attr("T: {float, half, bfloat16}")
+    .Attr("T: {float, double, half, bfloat16}")
     .Attr("transpose_a: bool = false")
     .Attr("transpose_b: bool = false")
     .SetShapeFn(::tensorflow::shape_inference::MatMulShape);

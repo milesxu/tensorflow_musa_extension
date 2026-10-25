@@ -60,9 +60,6 @@ class MusaSubOp : public MusaOpKernel {
 #define REGISTER_MUSA_SUB(TYPE)                                     \
   REGISTER_KERNEL_BUILDER(                                          \
       Name("Sub").Device(DEVICE_MTGPU).TypeConstraint<TYPE>("T"),   \
-      MusaSubOp<TYPE>);                                             \
-  REGISTER_KERNEL_BUILDER(                                          \
-      Name("SubV2").Device(DEVICE_MTGPU).TypeConstraint<TYPE>("T"), \
       MusaSubOp<TYPE>);
 
 REGISTER_MUSA_SUB(float);

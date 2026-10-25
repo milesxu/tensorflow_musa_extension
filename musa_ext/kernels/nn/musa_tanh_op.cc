@@ -4,6 +4,11 @@
 #include "tensorflow/core/framework/register_types.h"
 #include "tensorflow/core/util/bcast.h"
 
+#include <type_traits>
+
+extern "C" void LaunchMusaTanhDouble(const double* x, double* y, int64_t n,
+                                     musaStream_t stream);
+
 namespace tensorflow {
 namespace musa {
 
@@ -20,6 +25,13 @@ class MusaTanhOp : public MusaOpKernel {
     Tensor* output = nullptr;
     OP_REQUIRES_OK(ctx, ctx->allocate_output(0, input.shape(), &output));
     if (input.NumElements() == 0) return;
+
+    if constexpr (std::is_same<T, double>::value) {
+      LaunchMusaTanhDouble(input.flat<double>().data(),
+                           output->flat<double>().data(),
+                           input.NumElements(), GetMusaStreamByCtx(ctx));
+      return;
+    }
 
     MUSA_OP_REQUIRES_MUDNN_HANDLE(ctx);
     auto& handle = GetHandleByCtx(ctx);

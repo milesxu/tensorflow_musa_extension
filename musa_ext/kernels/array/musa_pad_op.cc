@@ -4,6 +4,7 @@
 #include <vector>
 
 #include "../utils_op.h"
+#include "musa_pad_params.h"
 #include "tensorflow/core/framework/op_kernel.h"
 #include "tensorflow/core/framework/register_types.h"
 #include "tensorflow/core/framework/tensor_shape.h"
@@ -16,34 +17,23 @@
 namespace tensorflow {
 namespace musa {
 extern "C" {
-void nd_pad_kernel_launcher_float(const float *, float *, const int,
-                                  const int64_t *, const int64_t *,
-                                  const int64_t *, const int64_t *, const float,
-                                  const int64_t, const musaStream_t);
-void nd_pad_kernel_launcher_double(const double *, double *, const int,
-                                   const int64_t *, const int64_t *,
-                                   const int64_t *, const int64_t *,
-                                   const double, const int64_t,
+void nd_pad_kernel_launcher_float(const float *, float *, MusaPadParams,
+                                  const float,
+                                  const musaStream_t);
+void nd_pad_kernel_launcher_double(const double *, double *, MusaPadParams,
+                                   const double,
                                    const musaStream_t);
-void nd_pad_kernel_launcher_int32(const int32_t *, int32_t *, const int,
-                                  const int64_t *, const int64_t *,
-                                  const int64_t *, const int64_t *,
-                                  const int32_t, const int64_t,
+void nd_pad_kernel_launcher_int32(const int32_t *, int32_t *, MusaPadParams,
+                                  const int32_t,
                                   const musaStream_t);
-void nd_pad_kernel_launcher_int64(const int64_t *, int64_t *, const int,
-                                  const int64_t *, const int64_t *,
-                                  const int64_t *, const int64_t *,
-                                  const int64_t, const int64_t,
+void nd_pad_kernel_launcher_int64(const int64_t *, int64_t *, MusaPadParams,
+                                  const int64_t,
                                   const musaStream_t);
-void nd_pad_kernel_launcher_uint8(const uint8_t *, uint8_t *, const int,
-                                  const int64_t *, const int64_t *,
-                                  const int64_t *, const int64_t *,
-                                  const uint8_t, const int64_t,
+void nd_pad_kernel_launcher_uint8(const uint8_t *, uint8_t *, MusaPadParams,
+                                  const uint8_t,
                                   const musaStream_t);
-void nd_pad_kernel_launcher_uint16(const uint16_t *, uint16_t *, const int,
-                                   const int64_t *, const int64_t *,
-                                   const int64_t *, const int64_t *,
-                                   const uint16_t, const int64_t,
+void nd_pad_kernel_launcher_uint16(const uint16_t *, uint16_t *, MusaPadParams,
+                                   const uint16_t,
                                    const musaStream_t);
 }
 
@@ -93,13 +83,10 @@ struct TypeTag<bfloat16> {
 
 #define DEFINE_PAD_LAUNCHER_IMPL(T, TAG, SUFFIX)                              \
   void CallPadLauncherImpl(                                                   \
-      const T *input_data, T *output_data, const int dims,                    \
-      const int64_t *in_dims, const int64_t *out_dims,                        \
-      const int64_t *pad_before, const int64_t *pad_after, const T pad_value, \
-      const int64_t total_out_elements, const musaStream_t stream, TAG) {     \
-    nd_pad_kernel_launcher_##SUFFIX(input_data, output_data, dims, in_dims,   \
-                                    out_dims, pad_before, pad_after,          \
-                                    pad_value, total_out_elements, stream);   \
+      const T *input_data, T *output_data, const MusaPadParams &params,       \
+      const T pad_value, const musaStream_t stream, TAG) {                    \
+    nd_pad_kernel_launcher_##SUFFIX(input_data, output_data, params,          \
+                                    pad_value, stream);                        \
   }
 
 DEFINE_PAD_LAUNCHER_IMPL(float, FloatTag, float)
@@ -112,50 +99,39 @@ DEFINE_PAD_LAUNCHER_IMPL(uint8_t, Uint8Tag, uint8)
 
 // half and bfloat16 dispatched via uint16 kernel (zero = 0x0000 for both)
 void CallPadLauncherImpl(const Eigen::half *input_data,
-                         Eigen::half *output_data, const int dims,
-                         const int64_t *in_dims, const int64_t *out_dims,
-                         const int64_t *pad_before, const int64_t *pad_after,
+                         Eigen::half *output_data,
+                         const MusaPadParams &params,
                          const Eigen::half pad_value,
-                         const int64_t total_out_elements,
                          const musaStream_t stream, HalfTag) {
   uint16_t pad_bits;
   memcpy(&pad_bits, &pad_value, sizeof(uint16_t));
   nd_pad_kernel_launcher_uint16(reinterpret_cast<const uint16_t *>(input_data),
-                                reinterpret_cast<uint16_t *>(output_data), dims,
-                                in_dims, out_dims, pad_before, pad_after,
-                                pad_bits, total_out_elements, stream);
+                                reinterpret_cast<uint16_t *>(output_data), params,
+                                pad_bits, stream);
 }
 
 void CallPadLauncherImpl(const bfloat16 *input_data, bfloat16 *output_data,
-                         const int dims, const int64_t *in_dims,
-                         const int64_t *out_dims, const int64_t *pad_before,
-                         const int64_t *pad_after, const bfloat16 pad_value,
-                         const int64_t total_out_elements,
+                         const MusaPadParams &params, const bfloat16 pad_value,
                          const musaStream_t stream, BFloat16Tag) {
   uint16_t pad_bits;
   memcpy(&pad_bits, &pad_value, sizeof(uint16_t));
   nd_pad_kernel_launcher_uint16(reinterpret_cast<const uint16_t *>(input_data),
-                                reinterpret_cast<uint16_t *>(output_data), dims,
-                                in_dims, out_dims, pad_before, pad_after,
-                                pad_bits, total_out_elements, stream);
+                                reinterpret_cast<uint16_t *>(output_data), params,
+                                pad_bits, stream);
 }
 
-void CallPadLauncherImpl(const void *, void *, const int, const int64_t *,
-                         const int64_t *, const int64_t *, const int64_t *,
-                         const int64_t, const int64_t, const musaStream_t,
-                         UnsupportedTag) {
+template <typename T>
+void CallPadLauncherImpl(const T *, T *, const MusaPadParams &, const T,
+                         const musaStream_t, UnsupportedTag) {
   throw std::invalid_argument("Pad not support current type");
 }
 
 template <typename T>
-void CallPadLauncher(const T *input_data, T *output_data, const int dims,
-                     const int64_t *in_dims, const int64_t *out_dims,
-                     const int64_t *pad_before, const int64_t *pad_after,
-                     const T pad_value, const int64_t total_out_elements,
+void CallPadLauncher(const T *input_data, T *output_data,
+                     const MusaPadParams &params, const T pad_value,
                      const musaStream_t stream) {
-  CallPadLauncherImpl(input_data, output_data, dims, in_dims, out_dims,
-                      pad_before, pad_after, pad_value, total_out_elements,
-                      stream, typename TypeTag<T>::type());
+  CallPadLauncherImpl(input_data, output_data, params, pad_value, stream,
+                      typename TypeTag<T>::type());
 }
 }  // namespace
 
@@ -192,62 +168,36 @@ class MusaPadOp : public OpKernel {
 
     typename TTypes<Tpadding>::ConstMatrix paddings_mat =
         paddings.matrix<Tpadding>();
-    int64_t pad_before[8], pad_after[8];
+    MusaPadParams params{};
+    params.dims = dims;
     for (int d = 0; d < dims; ++d) {
-      pad_before[d] = static_cast<int64_t>(paddings_mat(d, 0));
-      pad_after[d] = static_cast<int64_t>(paddings_mat(d, 1));
-      OP_REQUIRES(ctx, pad_before[d] >= 0 && pad_after[d] >= 0,
+      params.pad_before[d] = static_cast<int64_t>(paddings_mat(d, 0));
+      params.pad_after[d] = static_cast<int64_t>(paddings_mat(d, 1));
+      OP_REQUIRES(ctx, params.pad_before[d] >= 0 && params.pad_after[d] >= 0,
                   errors::InvalidArgument("Paddings must be non-negative"));
     }
 
     TensorShape out_shape;
     int64_t out_size = 1;
-    int64_t input_dims[8], out_dims[8];
     for (int d = 0; d < dims; ++d) {
-      int64_t out_dim = input.dim_size(d) + pad_before[d] + pad_after[d];
-      input_dims[d] = input.dim_size(d);
-      out_dims[d] = out_dim;
+      int64_t out_dim = input.dim_size(d) + params.pad_before[d] +
+                        params.pad_after[d];
+      params.in_dims[d] = input.dim_size(d);
+      params.out_dims[d] = out_dim;
       out_shape.AddDim(out_dim);
       out_size *= out_dim;
     }
+    params.total_out_elements = out_size;
 
     Tensor *output = nullptr;
     OP_REQUIRES_OK(ctx, ctx->allocate_output(0, out_shape, &output));
     if (out_size == 0) return;
 
-    Tensor pad_before_dev, pad_after_dev, pad_input_dims, pad_out_dims;
-    OP_REQUIRES_OK(ctx, ctx->allocate_temp(DT_INT64, TensorShape({dims}),
-                                           &pad_before_dev));
-    OP_REQUIRES_OK(
-        ctx, ctx->allocate_temp(DT_INT64, TensorShape({dims}), &pad_after_dev));
-    OP_REQUIRES_OK(ctx, ctx->allocate_temp(DT_INT64, TensorShape({dims}),
-                                           &pad_input_dims));
-    OP_REQUIRES_OK(
-        ctx, ctx->allocate_temp(DT_INT64, TensorShape({dims}), &pad_out_dims));
-
     musaStream_t stream = GetMusaStreamByCtx(ctx);
     OP_REQUIRES(ctx, stream != nullptr,
                 errors::Internal("MUSA stream is unavailable for Pad"));
-    musaMemcpyAsync(pad_before_dev.flat<int64_t>().data(), pad_before,
-                    dims * sizeof(int64_t), musaMemcpyHostToDevice, stream);
-    musaMemcpyAsync(pad_after_dev.flat<int64_t>().data(), pad_after,
-                    dims * sizeof(int64_t), musaMemcpyHostToDevice, stream);
-    musaMemcpyAsync(pad_input_dims.flat<int64_t>().data(), input_dims,
-                    dims * sizeof(int64_t), musaMemcpyHostToDevice, stream);
-    musaMemcpyAsync(pad_out_dims.flat<int64_t>().data(), out_dims,
-                    dims * sizeof(int64_t), musaMemcpyHostToDevice, stream);
-
-    CallPadLauncher<T>(input.flat<T>().data(), output->flat<T>().data(), dims,
-                       pad_input_dims.flat<int64_t>().data(),
-                       pad_out_dims.flat<int64_t>().data(),
-                       pad_before_dev.flat<int64_t>().data(),
-                       pad_after_dev.flat<int64_t>().data(), pad_value,
-                       out_size, stream);
-
-    musaError_t sync_err = musaStreamSynchronize(stream);
-    OP_REQUIRES(ctx, sync_err == musaSuccess,
-                errors::Internal("MUSA Pad stream synchronize failed: ",
-                                 musaGetErrorString(sync_err)));
+    CallPadLauncher<T>(input.flat<T>().data(), output->flat<T>().data(), params,
+                       pad_value, stream);
 
     musaError_t err = musaGetLastError();
     OP_REQUIRES(ctx, err == musaSuccess,

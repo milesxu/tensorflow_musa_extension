@@ -1,7 +1,9 @@
 #include <cstdint>
+#include <type_traits>
 #include <vector>
 
 #include "../utils_op.h"
+#include "musa_double_binary_broadcast_op_utils.h"
 #include "tensorflow/core/framework/op_kernel.h"
 #include "tensorflow/core/util/bcast.h"
 
@@ -287,6 +289,16 @@ class MusaMultiplyOp : public MusaOpKernel {
     }
 
     if (output->NumElements() == 0) return;
+
+    if constexpr (std::is_same<T, double>::value) {
+      DoubleBinaryBroadcastParams params;
+      OP_REQUIRES_OK(
+          ctx, FillDoubleBinaryBroadcastParams(in0, in1, *output, &params));
+      LaunchMulDoubleBroadcast(
+          in0.flat<double>().data(), in1.flat<double>().data(),
+          output->flat<double>().data(), params, GetMusaStreamByCtx(ctx));
+      return;
+    }
 
     const auto fast_path_status = TryLaunchMulFastPath<T>(
         ctx, in0, in1, output_shape, same_shape, output);

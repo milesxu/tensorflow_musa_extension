@@ -1,4 +1,7 @@
+#include <type_traits>
+
 #include "../utils_op.h"
+#include "musa_double_binary_broadcast_op_utils.h"
 #include "tensorflow/core/framework/bfloat16.h"
 #include "tensorflow/core/framework/op_kernel.h"
 #include "tensorflow/core/framework/register_types.h"
@@ -46,6 +49,17 @@ class MusaRealDivOp : public MusaOpKernel {
 
     if (dividend.NumElements() == 0 || divisor.NumElements() == 0 ||
         output_shape.num_elements() == 0) {
+      return;
+    }
+
+    if constexpr (std::is_same<T, double>::value) {
+      DoubleBinaryBroadcastParams params;
+      OP_REQUIRES_OK(
+          ctx,
+          FillDoubleBinaryBroadcastParams(dividend, divisor, *out, &params));
+      LaunchRealDivDoubleBroadcast(
+          dividend.flat<double>().data(), divisor.flat<double>().data(),
+          out->flat<double>().data(), params, GetMusaStreamByCtx(ctx));
       return;
     }
 
