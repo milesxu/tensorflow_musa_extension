@@ -10,9 +10,10 @@
 #include <array>
 #include <cstdint>
 #include <cstdio>
+#include <map>
 #include <memory>
 #include <mutex>
-#include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "mu/device/musa_capture_event_registry.h"
@@ -66,16 +67,18 @@ std::mutex& FixedGraphMutex() {
   return mutex;
 }
 
-std::unordered_map<int64_t, FixedGraphStatePtr>& FixedGraphs() {
-  static std::unordered_map<int64_t, FixedGraphStatePtr> graphs;
+using FixedGraphKey = std::pair<int64_t, int64_t>;
+
+std::map<FixedGraphKey, FixedGraphStatePtr>& FixedGraphs() {
+  static std::map<FixedGraphKey, FixedGraphStatePtr> graphs;
   return graphs;
 }
 
 FixedGraphStatePtr FindFixedGraph(int64_t handle, int64_t generation) {
   std::lock_guard<std::mutex> lock(FixedGraphMutex());
   auto& graphs = FixedGraphs();
-  auto it = graphs.find(handle);
-  if (it == graphs.end() || it->second->generation != generation) {
+  auto it = graphs.find(FixedGraphKey(handle, generation));
+  if (it == graphs.end()) {
     return nullptr;
   }
   return it->second;
@@ -85,9 +88,8 @@ void RemoveFixedGraph(int64_t handle, int64_t generation,
                       const FixedGraphStatePtr& expected) {
   std::lock_guard<std::mutex> lock(FixedGraphMutex());
   auto& graphs = FixedGraphs();
-  auto it = graphs.find(handle);
-  if (it != graphs.end() && it->second == expected &&
-      it->second->generation == generation) {
+  auto it = graphs.find(FixedGraphKey(handle, generation));
+  if (it != graphs.end() && it->second == expected) {
     graphs.erase(it);
   }
 }
@@ -124,17 +126,26 @@ Status DestroyCaptureEvents(std::vector<musaEvent_t>* events, int device_id) {
     musaSetDevice(device_id);
   }
   Status first_error = OkStatus();
+  std::vector<musaEvent_t> remaining;
+  size_t destroyed = 0;
   for (musaEvent_t event : *events) {
     const musaError_t err = musaEventDestroy(event);
-    if (err != musaSuccess && first_error.ok()) {
-      first_error = errors::Internal("musaEventDestroy failed: ",
-                                     static_cast<int>(err));
+    if (err == musaSuccess) {
+      ++destroyed;
+    } else {
+      remaining.push_back(event);
+      if (first_error.ok()) {
+        first_error = errors::Internal("musaEventDestroy failed: ",
+                                       static_cast<int>(err));
+      }
     }
   }
-  const size_t destroyed = events->size();
-  events->clear();
-  std::fprintf(stderr, "FIXED_GRAPH_EVENT_DESTROY count=%zu status=%s\n",
-               destroyed, first_error.ok() ? "OK" : "ERROR");
+  events->swap(remaining);
+  std::fprintf(stderr,
+               "FIXED_GRAPH_EVENT_DESTROY destroyed=%zu remaining=%zu "
+               "status=%s\n",
+               destroyed, events->size(),
+               first_error.ok() ? "OK" : "ERROR");
   return first_error;
 }
 
@@ -230,24 +241,12 @@ class MusaFixedGraphCaptureBeginOp : public OpKernel {
       return;
     }
 
-    {
-      std::lock_guard<std::mutex> lock(FixedGraphMutex());
-      auto& graphs = FixedGraphs();
-      if (graphs.find(handle_) != graphs.end()) {
-        ctx->CtxFailure(errors::AlreadyExists(
-            "fixed graph handle already exists: ", handle_));
-        return;
-      }
-      graphs.emplace(handle_, state);
-    }
-
     unsigned int* counter = nullptr;
     auto fail = [&](const Status& status) {
       if (counter != nullptr) {
         musaFree(counter);
         counter = nullptr;
       }
-      RemoveFixedGraph(handle_, generation_, state);
       ctx->CtxFailure(status);
     };
 
@@ -298,6 +297,23 @@ class MusaFixedGraphCaptureBeginOp : public OpKernel {
     {
       std::lock_guard<std::mutex> lock(state->mutex);
       state->capture_id = capture_id;
+    }
+    {
+      std::lock_guard<std::mutex> lock(FixedGraphMutex());
+      auto& graphs = FixedGraphs();
+      const FixedGraphKey key(handle_, generation_);
+      if (graphs.find(key) != graphs.end()) {
+        musaGraph_t aborted_graph = nullptr;
+        musaStreamEndCapture(state->stream, &aborted_graph);
+        if (aborted_graph != nullptr) {
+          musaGraphDestroy(aborted_graph);
+        }
+        fail(errors::AlreadyExists(
+            "fixed graph handle/generation already exists: ", handle_, "/",
+            generation_));
+        return;
+      }
+      graphs.emplace(key, state);
     }
     std::fprintf(stderr,
                  "FIXED_GRAPH_BEGIN handle=%lld generation=%lld device=%d "
@@ -428,7 +444,8 @@ class MusaFixedGraphCaptureEndOp : public OpKernel {
       return;
     }
     state->graph = graph;
-    state->capture_events = TakeCaptureDependencyEvents(state->capture_id);
+    state->capture_events = TakeCaptureDependencyEvents(
+        state->device_id, state->capture_id);
     state->capture_event_count = state->capture_events.size();
 
     status = InspectGraph(graph, MusaGraphCounterTickKernelAddress(),
@@ -884,7 +901,7 @@ class MusaFixedGraphReleaseOp : public OpKernel {
 
     if (state->capture_id != 0) {
       std::vector<musaEvent_t> pending =
-          TakeCaptureDependencyEvents(state->capture_id);
+          TakeCaptureDependencyEvents(state->device_id, state->capture_id);
       state->capture_events.insert(state->capture_events.end(),
                                    pending.begin(), pending.end());
       state->capture_event_count =
@@ -900,57 +917,63 @@ class MusaFixedGraphReleaseOp : public OpKernel {
       return;
     }
 
-    Status first_error = OkStatus();
-    auto record_error = [&](const Status& status) {
-      if (!status.ok() && first_error.ok()) {
-        first_error = status;
-      }
+    auto fail_cleanup = [&](const Status& status) {
+      state->phase = FixedGraphPhase::kFailed;
+      ctx->CtxFailure(status);
     };
     if (state->exec != nullptr) {
       const Status status = CheckMusa(musaGraphExecDestroy(state->exec),
                                       "musaGraphExecDestroy");
-      record_error(status);
-      if (status.ok()) {
-        state->exec = nullptr;
+      if (!status.ok()) {
+        fail_cleanup(status);
+        return;
       }
+      state->exec = nullptr;
     }
     if (state->graph != nullptr) {
       const Status status =
           CheckMusa(musaGraphDestroy(state->graph), "musaGraphDestroy");
-      record_error(status);
-      if (status.ok()) {
-        state->graph = nullptr;
+      if (!status.ok()) {
+        fail_cleanup(status);
+        return;
+      }
+      state->graph = nullptr;
+    }
+    {
+      const Status status = DestroyCaptureEvents(&state->capture_events,
+                                                 state->device_id);
+      if (!status.ok()) {
+        fail_cleanup(status);
+        return;
       }
     }
-    record_error(DestroyCaptureEvents(&state->capture_events,
-                                      state->device_id));
     if (state->counter != nullptr) {
       const Status status = CheckMusa(musaFree(state->counter), "musaFree");
-      record_error(status);
-      if (status.ok()) {
-        state->counter = nullptr;
+      if (!status.ok()) {
+        fail_cleanup(status);
+        return;
       }
+      state->counter = nullptr;
+    }
+    if (state->capture_id != 0 &&
+        PendingCaptureDependencyEventCount(state->device_id,
+                                           state->capture_id) != 0) {
+      fail_cleanup(errors::Internal(
+          "capture dependency events remain after release"));
+      return;
+    }
+    if (state->capture_id != 0) {
+      ReleaseCaptureDependencyGate(state->device_id, state->capture_id);
     }
     state->a = Tensor();
     state->b = Tensor();
     state->c = Tensor();
-    if (state->capture_id != 0 &&
-        PendingCaptureDependencyEventCount(state->capture_id) != 0) {
-      record_error(errors::Internal(
-          "capture dependency events remain after release"));
-    }
     std::fprintf(stderr,
                  "FIXED_GRAPH_RELEASE handle=%lld generation=%lld "
-                 "capture_id=%llu events=%zu status=%s\n",
+                 "capture_id=%llu events=%zu status=OK\n",
                  static_cast<long long>(handle_),
                  static_cast<long long>(generation_), state->capture_id,
-                 state->capture_event_count,
-                 first_error.ok() ? "OK" : "ERROR");
-    if (!first_error.ok()) {
-      state->phase = FixedGraphPhase::kFailed;
-      ctx->CtxFailure(first_error);
-      return;
-    }
+                 state->capture_event_count);
     RemoveFixedGraph(handle_, generation_, state);
   }
 

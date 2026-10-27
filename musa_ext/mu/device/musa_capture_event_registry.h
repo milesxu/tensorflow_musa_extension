@@ -11,12 +11,14 @@ namespace musa {
 
 // Capture-scoped event ownership. Events are retained while a stream capture
 // is active and claimed by the graph owner before the graph is released.
-void RetainCaptureDependencyEvent(musaEvent_t event,
+bool RetainCaptureDependencyEvent(musaEvent_t event, int device_id,
                                   unsigned long long capture_id);
 std::vector<musaEvent_t> TakeCaptureDependencyEvents(
-    unsigned long long capture_id);
+    int device_id, unsigned long long capture_id);
 std::size_t PendingCaptureDependencyEventCount(
-    unsigned long long capture_id);
+    int device_id, unsigned long long capture_id);
+void ReleaseCaptureDependencyGate(int device_id,
+                                  unsigned long long capture_id);
 
 }  // namespace musa
 }  // namespace tensorflow

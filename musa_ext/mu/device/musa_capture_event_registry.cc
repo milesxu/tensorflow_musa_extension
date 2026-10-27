@@ -1,7 +1,8 @@
 #include "musa_capture_event_registry.h"
 
+#include <map>
 #include <mutex>
-#include <unordered_map>
+#include <utility>
 
 namespace tensorflow {
 namespace musa {
@@ -12,40 +13,58 @@ std::mutex& CaptureEventMutex() {
   return mutex;
 }
 
-std::unordered_map<unsigned long long, std::vector<musaEvent_t>>&
-CaptureEvents() {
-  static std::unordered_map<unsigned long long, std::vector<musaEvent_t>>
-      events;
+struct CaptureEventGroup {
+  bool sealed = false;
+  std::vector<musaEvent_t> events;
+};
+
+using CaptureEventKey = std::pair<int, unsigned long long>;
+
+std::map<CaptureEventKey, CaptureEventGroup>& CaptureEvents() {
+  static std::map<CaptureEventKey, CaptureEventGroup> events;
   return events;
 }
 
 }  // namespace
 
-void RetainCaptureDependencyEvent(musaEvent_t event,
+bool RetainCaptureDependencyEvent(musaEvent_t event, int device_id,
                                   unsigned long long capture_id) {
   std::lock_guard<std::mutex> lock(CaptureEventMutex());
-  CaptureEvents()[capture_id].push_back(event);
+  CaptureEventGroup& group =
+      CaptureEvents()[CaptureEventKey(device_id, capture_id)];
+  if (group.sealed) {
+    return false;
+  }
+  group.events.push_back(event);
+  return true;
 }
 
 std::vector<musaEvent_t> TakeCaptureDependencyEvents(
-    unsigned long long capture_id) {
+    int device_id, unsigned long long capture_id) {
   std::lock_guard<std::mutex> lock(CaptureEventMutex());
   auto& events = CaptureEvents();
-  auto it = events.find(capture_id);
+  auto it = events.find(CaptureEventKey(device_id, capture_id));
   if (it == events.end()) {
     return {};
   }
-  std::vector<musaEvent_t> taken = std::move(it->second);
-  events.erase(it);
+  it->second.sealed = true;
+  std::vector<musaEvent_t> taken = std::move(it->second.events);
+  it->second.events.clear();
   return taken;
 }
 
 std::size_t PendingCaptureDependencyEventCount(
-    unsigned long long capture_id) {
+    int device_id, unsigned long long capture_id) {
   std::lock_guard<std::mutex> lock(CaptureEventMutex());
   auto& events = CaptureEvents();
-  auto it = events.find(capture_id);
-  return it == events.end() ? 0 : it->second.size();
+  auto it = events.find(CaptureEventKey(device_id, capture_id));
+  return it == events.end() ? 0 : it->second.events.size();
+}
+
+void ReleaseCaptureDependencyGate(int device_id,
+                                  unsigned long long capture_id) {
+  std::lock_guard<std::mutex> lock(CaptureEventMutex());
+  CaptureEvents().erase(CaptureEventKey(device_id, capture_id));
 }
 
 }  // namespace musa

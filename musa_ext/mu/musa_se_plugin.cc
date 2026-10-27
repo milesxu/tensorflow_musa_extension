@@ -439,7 +439,13 @@ void plugin_se_create_stream_dependency(const SP_Device* device,
   if (other_capturing || dependent_capturing) {
     const unsigned long long capture_id =
         other_capturing ? other_capture_id : dependent_capture_id;
-    ::tensorflow::musa::RetainCaptureDependencyEvent(event, capture_id);
+    if (!::tensorflow::musa::RetainCaptureDependencyEvent(event, dev_ord,
+                                                          capture_id)) {
+      musaEventDestroy(event);
+      TF_SetStatus(status, TF_INTERNAL,
+                   "capture dependency event arrived after capture seal");
+      return;
+    }
     LOG(INFO) << "Retained capture dependency event: capture_id=" << capture_id
               << " other_capturing=" << other_capturing
               << " dependent_capturing=" << dependent_capturing;
