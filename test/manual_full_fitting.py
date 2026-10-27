@@ -1,4 +1,5 @@
 import hashlib
+import time
 from pathlib import Path
 
 import numpy as np
@@ -21,8 +22,8 @@ def file_sha256(path):
     return digest.hexdigest()
 
 
-def make_inputs():
-    rng = np.random.default_rng(20261027)
+def make_inputs(seed):
+    rng = np.random.default_rng(seed)
     box_length = 30.0
     local = rng.uniform(1.0, box_length - 1.0, size=(NLOC, 3))
     ghost_count = NALL - NLOC
@@ -86,6 +87,79 @@ def diff_stats(label, actual, expected):
     }
 
 
+def run_reference(
+    sess,
+    graph_tensors,
+    fitting_tensors,
+    identity_pairs,
+    reference,
+    seed,
+):
+    box, coord, atom_type, natoms, mesh = graph_tensors
+    box_value, coord_value, type_value, natoms_value, mesh_value = (
+        make_inputs(seed)
+    )
+    values = sess.run(
+        fitting_tensors
+        + [tensor for pair in identity_pairs for tensor in pair]
+        + [reference],
+        feed_dict={
+            box: box_value,
+            coord: coord_value,
+            atom_type: type_value,
+            natoms: natoms_value,
+            mesh: mesh_value,
+        },
+    )
+    arrays = values[: len(fitting_tensors)]
+    identity_values = values[len(fitting_tensors) : -1]
+    expected = values[-1]
+    for index in range(3):
+        tanh_value = identity_values[index * 2]
+        reshape_value = identity_values[index * 2 + 1]
+        if not np.array_equal(tanh_value, reshape_value):
+            raise RuntimeError(f"layer {index} Tanh/Reshape is not identity")
+    if arrays[9].shape != (240,) or arrays[10].shape != (240,):
+        raise RuntimeError("residual idt shape mismatch")
+    if not np.all(np.isfinite(arrays[9])) or not np.all(
+        np.isfinite(arrays[10])
+    ):
+        raise RuntimeError("residual idt is not finite")
+    cpu_expected = numpy_fitting_reference(arrays)
+    if not np.all(np.isfinite(cpu_expected)):
+        raise RuntimeError("NumPy reference output is not finite")
+    return {
+        "arrays": arrays,
+        "expected": expected,
+        "cpu_expected": cpu_expected,
+        "seed": seed,
+    }
+
+
+def check_result(label, result, expected, cpu_expected):
+    if result.shape != expected.shape:
+        raise RuntimeError(f"{label} output shape mismatch")
+    if not np.all(np.isfinite(result)):
+        raise RuntimeError(f"{label} output is not finite")
+    manual_vs_musa = diff_stats(
+        f"{label}_manual_vs_musa", result, expected
+    )
+    diff_stats(f"{label}_musa_vs_cpu", expected, cpu_expected)
+    manual_vs_cpu = diff_stats(
+        f"{label}_manual_vs_cpu", result, cpu_expected
+    )
+    if (
+        manual_vs_cpu["max_abs_diff"] > 2e-5
+        or manual_vs_cpu["nrmse"] > 1e-6
+    ):
+        raise RuntimeError(f"{label} manual fitting differs from NumPy CPU")
+    if (
+        manual_vs_musa["max_abs_diff"] > 5e-3
+        or manual_vs_musa["nrmse"] > 2e-4
+    ):
+        raise RuntimeError(f"{label} manual fitting differs from MUSA")
+
+
 def main():
     plugin_path = Path(tensorflow_musa.__file__).with_name("libmusa_plugin.so")
     print("tensorflow_version", tf.__version__)
@@ -132,46 +206,58 @@ def main():
                 "final_layer_type_0/BiasAdd:0"
             )
 
-    box_value, coord_value, type_value, natoms_value, mesh_value = make_inputs()
+    graph_tensors = [box, coord, atom_type, natoms, mesh]
     with tf.compat.v1.Session(graph=graph) as sess:
-        values = sess.run(
-            tensors
-            + [tensor for pair in identity_pairs for tensor in pair]
-            + [reference],
-            feed_dict={
-                box: box_value,
-                coord: coord_value,
-                atom_type: type_value,
-                natoms: natoms_value,
-                mesh: mesh_value,
-            },
+        reference_a = run_reference(
+            sess,
+            graph_tensors,
+            tensors,
+            identity_pairs,
+            reference,
+            20261027,
         )
-    arrays = values[: len(tensors)]
-    identity_values = values[len(tensors) : -1]
-    expected = values[-1]
-    for index in range(3):
-        tanh_value = identity_values[index * 2]
-        reshape_value = identity_values[index * 2 + 1]
-        if not np.array_equal(tanh_value, reshape_value):
-            raise RuntimeError(f"layer {index} Tanh/Reshape is not identity")
-    if arrays[9].shape != (240,) or arrays[10].shape != (240,):
-        raise RuntimeError("residual idt shape mismatch")
-    if not np.all(np.isfinite(arrays[9])) or not np.all(
-        np.isfinite(arrays[10])
-    ):
-        raise RuntimeError("residual idt is not finite")
-    cpu_expected = numpy_fitting_reference(arrays)
-    print("input_shapes", [array.shape for array in arrays])
-    print("reference_shape", expected.shape, expected.dtype)
+        reference_b = run_reference(
+            sess,
+            graph_tensors,
+            tensors,
+            identity_pairs,
+            reference,
+            20261028,
+        )
+    arrays_a = reference_a["arrays"]
+    arrays_b = reference_b["arrays"]
+    expected_a = reference_a["expected"]
+    expected_b = reference_b["expected"]
+    cpu_expected_a = reference_a["cpu_expected"]
+    cpu_expected_b = reference_b["cpu_expected"]
+    if np.array_equal(arrays_a[0], arrays_b[0]):
+        raise RuntimeError("second fixture did not change fitting input")
+    for index in range(1, len(arrays_a)):
+        if not np.array_equal(arrays_a[index], arrays_b[index]):
+            raise RuntimeError(f"fixture changed weight/idt input {index}")
+    print("input_shapes", [array.shape for array in arrays_a])
+    print("reference_seeds", reference_a["seed"], reference_b["seed"])
+    print("reference_shape", expected_a.shape, expected_a.dtype)
     print("tanh_reshape_identity", True)
-    print("idt_shapes", arrays[9].shape, arrays[10].shape)
+    print("idt_shapes", arrays_a[9].shape, arrays_a[10].shape)
+    print("fixture_x_changed", True)
+    print("fixture_weights_identical", True)
     print(
-        "reference_stats",
+        "reference_a_stats",
         {
-            "min": float(np.min(expected)),
-            "max": float(np.max(expected)),
-            "mean": float(np.mean(expected)),
-            "rms": float(np.sqrt(np.mean(np.square(expected)))),
+            "min": float(np.min(expected_a)),
+            "max": float(np.max(expected_a)),
+            "mean": float(np.mean(expected_a)),
+            "rms": float(np.sqrt(np.mean(np.square(expected_a)))),
+        },
+    )
+    print(
+        "reference_b_stats",
+        {
+            "min": float(np.min(expected_b)),
+            "max": float(np.max(expected_b)),
+            "mean": float(np.mean(expected_b)),
+            "rms": float(np.sqrt(np.mean(np.square(expected_b)))),
         },
     )
 
@@ -181,55 +267,56 @@ def main():
         with tf.device("/device:MUSA:0"):
             placeholders = [
                 tf.compat.v1.placeholder(tf.float32, shape=array.shape)
-                for array in arrays
+                for array in arrays_a
             ]
             actual = ops.musa_manual_graph_full_fitting(*placeholders)
     with tf.compat.v1.Session(graph=cap_graph) as sess:
-        results = [
-            sess.run(actual, feed_dict=dict(zip(placeholders, arrays)))
-            for _ in range(3)
-        ]
-    for repeat_index in range(1, len(results)):
-        if not np.array_equal(results[0], results[repeat_index]):
-            raise RuntimeError(
-                f"repeat {repeat_index} output is not bitwise identical"
-            )
-    result = results[0]
+        start_a1 = time.perf_counter()
+        result_a1 = sess.run(
+            actual, feed_dict=dict(zip(placeholders, arrays_a))
+        )
+        start_b = time.perf_counter()
+        result_b = sess.run(
+            actual, feed_dict=dict(zip(placeholders, arrays_b))
+        )
+        start_a2 = time.perf_counter()
+        result_a2 = sess.run(
+            actual, feed_dict=dict(zip(placeholders, arrays_a))
+        )
+        end_a2 = time.perf_counter()
+    if not np.array_equal(result_a1, result_a2):
+        raise RuntimeError("cached exec repeat A output changed")
+    if np.array_equal(result_a1, result_b):
+        raise RuntimeError("cached exec did not react to changed input")
 
-    print("result_shape", result.shape)
-    print("repeat_calls", len(results))
-    print("repeat_bitwise", True)
+    print("result_shape", result_a1.shape)
+    print("cache_calls", 3)
+    print("cache_repeat_a_bitwise", True)
+    print("cache_input_sensitivity", True)
+    cache_miss_ms = (start_b - start_a1) * 1e3
+    cache_hit_b_ms = (start_a2 - start_b) * 1e3
+    cache_hit_a_ms = (end_a2 - start_a2) * 1e3
+    print("cache_miss_ms", cache_miss_ms)
+    print("cache_hit_b_ms", cache_hit_b_ms)
+    print("cache_hit_a_ms", cache_hit_a_ms)
     print(
-        "result_stats",
+        "cache_hit_avg_ms",
+        (cache_hit_b_ms + cache_hit_a_ms) / 2.0,
+    )
+    print(
+        "result_a_stats",
         {
-            "min": float(np.min(result)),
-            "max": float(np.max(result)),
-            "mean": float(np.mean(result)),
-            "rms": float(np.sqrt(np.mean(np.square(result)))),
+            "min": float(np.min(result_a1)),
+            "max": float(np.max(result_a1)),
+            "mean": float(np.mean(result_a1)),
+            "rms": float(np.sqrt(np.mean(np.square(result_a1)))),
         },
     )
-    manual_vs_musa = diff_stats("manual_vs_musa", result, expected)
-    diff_stats("musa_vs_cpu", expected, cpu_expected)
-    manual_vs_cpu = diff_stats("manual_vs_cpu", result, cpu_expected)
-    if result.shape != expected.shape:
-        raise RuntimeError("full fitting output shape mismatch")
-    if not np.all(np.isfinite(result)):
-        raise RuntimeError("full fitting output is not finite")
-    if not np.all(np.isfinite(cpu_expected)):
-        raise RuntimeError("NumPy reference output is not finite")
-    if (
-        manual_vs_cpu["max_abs_diff"] > 2e-5
-        or manual_vs_cpu["nrmse"] > 1e-6
-    ):
-        raise RuntimeError("manual fitting differs from NumPy CPU reference")
-    if (
-        manual_vs_musa["max_abs_diff"] > 5e-3
-        or manual_vs_musa["nrmse"] > 2e-4
-    ):
-        raise RuntimeError("manual fitting differs from MUSA reference")
+    check_result("a", result_a1, expected_a, cpu_expected_a)
+    check_result("b", result_b, expected_b, cpu_expected_b)
     print("manual_vs_cpu_gate", "max_abs<=2e-5 nrmse<=1e-6")
     print("manual_vs_musa_gate", "max_abs<=5e-3 nrmse<=2e-4")
-    print("MANUAL_FULL_FITTING_PASS")
+    print("MANUAL_FULL_FITTING_CACHE_PASS")
 
 
 if __name__ == "__main__":
