@@ -119,6 +119,14 @@ extern "C" void* MusaManualGraphBiasTanhFloatKernelAddress() {
   return reinterpret_cast<void*>(MusaManualGraphBiasTanhFloatKernel);
 }
 
+extern "C" void* MusaManualGraphBiasFloatKernelAddress() {
+  return reinterpret_cast<void*>(MusaManualGraphBiasFloatKernel);
+}
+
+extern "C" void* MusaManualGraphResidualFloatKernelAddress() {
+  return reinterpret_cast<void*>(MusaManualGraphResidualFloatKernel);
+}
+
 extern "C" void LaunchMusaManualGraphBiasTanhFloat(
     const float* input, const float* bias, float* pre, float* output,
     int elements, int width, musaStream_t stream) {

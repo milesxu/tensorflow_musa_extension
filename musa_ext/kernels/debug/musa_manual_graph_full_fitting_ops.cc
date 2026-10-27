@@ -23,6 +23,10 @@ extern "C" void LaunchMusaManualGraphBiasFloat(
 extern "C" void LaunchMusaManualGraphResidualFloat(
     const float* previous, const float* current, const float* idt,
     float* output, int elements, int width, musaStream_t stream);
+extern "C" void* MusaGraphCounterTickKernelAddress();
+extern "C" void* MusaManualGraphBiasTanhFloatKernelAddress();
+extern "C" void* MusaManualGraphBiasFloatKernelAddress();
+extern "C" void* MusaManualGraphResidualFloatKernelAddress();
 
 namespace tensorflow {
 namespace musa {
@@ -358,12 +362,62 @@ class MusaManualGraphFullFittingOp : public OpKernel {
         "musaGraphGetNodes(full_fitting,data)");
     if (!status.ok()) return fail(status);
     size_t kernel_count = 0;
-    for (musaGraphNode_t node : nodes) {
+    size_t mublas_kernel_count = 0;
+    size_t bias_tanh_kernel_count = 0;
+    size_t bias_kernel_count = 0;
+    size_t residual_kernel_count = 0;
+    size_t tick_kernel_count = 0;
+    void* bias_tanh_kernel = MusaManualGraphBiasTanhFloatKernelAddress();
+    void* bias_kernel = MusaManualGraphBiasFloatKernelAddress();
+    void* residual_kernel = MusaManualGraphResidualFloatKernelAddress();
+    void* tick_kernel = MusaGraphCounterTickKernelAddress();
+    if (bias_tanh_kernel == nullptr || bias_kernel == nullptr ||
+        residual_kernel == nullptr || tick_kernel == nullptr) {
+      return fail(errors::Internal("full fitting kernel address is null"));
+    }
+    for (size_t i = 0; i < nodes.size(); ++i) {
       musaGraphNodeType type;
-      status = CheckMusa(musaGraphNodeGetType(node, &type),
+      status = CheckMusa(musaGraphNodeGetType(nodes[i], &type),
                          "musaGraphNodeGetType(full_fitting)");
       if (!status.ok()) return fail(status);
-      if (type == musaGraphNodeTypeKernel) ++kernel_count;
+      if (type != musaGraphNodeTypeKernel) continue;
+      ++kernel_count;
+      musaKernelNodeParams params{};
+      status = CheckMusa(
+          musaGraphKernelNodeGetParams(nodes[i], &params),
+          "musaGraphKernelNodeGetParams(full_fitting)");
+      if (!status.ok()) return fail(status);
+      const char* name = "<unavailable>";
+      if (musaFuncGetName(&name, params.func) != musaSuccess) {
+        name = "<unavailable>";
+      }
+      if (params.func == bias_tanh_kernel) {
+        ++bias_tanh_kernel_count;
+      } else if (params.func == bias_kernel) {
+        ++bias_kernel_count;
+      } else if (params.func == residual_kernel) {
+        ++residual_kernel_count;
+      } else if (params.func == tick_kernel) {
+        ++tick_kernel_count;
+      } else {
+        ++mublas_kernel_count;
+      }
+      std::fprintf(
+          stderr,
+          "FULL_FITTING_KERNEL index=%zu func=%p name=%s "
+          "grid=(%u,%u,%u) block=(%u,%u,%u) shared=%u\n",
+          i, params.func, name, params.gridDim.x, params.gridDim.y,
+          params.gridDim.z, params.blockDim.x, params.blockDim.y,
+          params.blockDim.z, params.sharedMemBytes);
+    }
+    if (mublas_kernel_count != 6 || bias_tanh_kernel_count != 3 ||
+        bias_kernel_count != 1 || residual_kernel_count != 2 ||
+        tick_kernel_count != 1) {
+      return fail(errors::Internal(
+          "full fitting kernel composition mismatch: mublas=",
+          mublas_kernel_count, " bias_tanh=", bias_tanh_kernel_count,
+          " bias=", bias_kernel_count, " residual=", residual_kernel_count,
+          " tick=", tick_kernel_count));
     }
 
     status = CheckMusa(musaGraphInstantiate(&exec, graph, 0),
@@ -424,9 +478,12 @@ class MusaManualGraphFullFittingOp : public OpKernel {
                                    tick_count));
     }
     std::fprintf(stderr,
-                 "MANUAL_FULL_FITTING_PROBE nodes=%zu kernels=%zu tick=2 "
+                 "MANUAL_FULL_FITTING_PROBE nodes=%zu kernels=%zu "
+                 "mublas=%zu bias_tanh=%zu bias=%zu residual=%zu tick=2 "
                  "shape=%dx1 replay_bitwise=1 finite=1\n",
-                 node_count, kernel_count, kM);
+                 node_count, kernel_count, mublas_kernel_count,
+                 bias_tanh_kernel_count, bias_kernel_count,
+                 residual_kernel_count, kM);
     cleanup();
   }
 };

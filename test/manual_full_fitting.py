@@ -48,20 +48,31 @@ def diff_stats(label, actual, expected):
     diff = np.abs(actual - expected)
     rms = float(np.sqrt(np.mean(np.square(actual - expected))))
     expected_rms = float(np.sqrt(np.mean(np.square(expected))))
+    max_abs_diff = float(np.max(diff))
+    mean_abs_diff = float(np.mean(diff))
+    p99_abs_diff = float(np.percentile(diff, 99))
+    nrmse = rms / max(expected_rms, np.finfo(np.float32).tiny)
     print(
         f"{label}_max_abs_diff",
-        float(np.max(diff)),
+        max_abs_diff,
     )
     print(
         f"{label}_mean_abs_diff",
-        float(np.mean(diff)),
+        mean_abs_diff,
     )
     print(
         f"{label}_p99_abs_diff",
-        float(np.percentile(diff, 99)),
+        p99_abs_diff,
     )
     print(f"{label}_rms_diff", rms)
-    print(f"{label}_nrmse", rms / max(expected_rms, np.finfo(np.float32).tiny))
+    print(f"{label}_nrmse", nrmse)
+    return {
+        "max_abs_diff": max_abs_diff,
+        "mean_abs_diff": mean_abs_diff,
+        "p99_abs_diff": p99_abs_diff,
+        "rms_diff": rms,
+        "nrmse": nrmse,
+    }
 
 
 def main():
@@ -158,12 +169,20 @@ def main():
             ]
             actual = ops.musa_manual_graph_full_fitting(*placeholders)
     with tf.compat.v1.Session(graph=cap_graph) as sess:
-        result = sess.run(
-            actual,
-            feed_dict=dict(zip(placeholders, arrays)),
-        )
+        results = [
+            sess.run(actual, feed_dict=dict(zip(placeholders, arrays)))
+            for _ in range(3)
+        ]
+    for repeat_index in range(1, len(results)):
+        if not np.array_equal(results[0], results[repeat_index]):
+            raise RuntimeError(
+                f"repeat {repeat_index} output is not bitwise identical"
+            )
+    result = results[0]
 
     print("result_shape", result.shape)
+    print("repeat_calls", len(results))
+    print("repeat_bitwise", True)
     print(
         "result_stats",
         {
@@ -173,17 +192,27 @@ def main():
             "rms": float(np.sqrt(np.mean(np.square(result)))),
         },
     )
-    diff_stats("manual_vs_musa", result, expected)
+    manual_vs_musa = diff_stats("manual_vs_musa", result, expected)
     diff_stats("musa_vs_cpu", expected, cpu_expected)
-    diff_stats("manual_vs_cpu", result, cpu_expected)
+    manual_vs_cpu = diff_stats("manual_vs_cpu", result, cpu_expected)
     if result.shape != expected.shape:
         raise RuntimeError("full fitting output shape mismatch")
     if not np.all(np.isfinite(result)):
         raise RuntimeError("full fitting output is not finite")
     if not np.all(np.isfinite(cpu_expected)):
         raise RuntimeError("NumPy reference output is not finite")
-    if not np.allclose(result, expected, rtol=1e-2, atol=1e-2):
-        raise RuntimeError("full fitting output mismatch")
+    if (
+        manual_vs_cpu["max_abs_diff"] > 2e-5
+        or manual_vs_cpu["nrmse"] > 1e-6
+    ):
+        raise RuntimeError("manual fitting differs from NumPy CPU reference")
+    if (
+        manual_vs_musa["max_abs_diff"] > 5e-3
+        or manual_vs_musa["nrmse"] > 2e-4
+    ):
+        raise RuntimeError("manual fitting differs from MUSA reference")
+    print("manual_vs_cpu_gate", "max_abs<=2e-5 nrmse<=1e-6")
+    print("manual_vs_musa_gate", "max_abs<=5e-3 nrmse<=2e-4")
     print("MANUAL_FULL_FITTING_PASS")
 
 
