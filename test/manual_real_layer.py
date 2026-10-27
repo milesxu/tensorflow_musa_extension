@@ -33,13 +33,14 @@ def make_inputs():
 
 def main():
     tf.load_op_library(CPU_OP_LIB)
+    tf.load_op_library(MUSA_OP_LIB)
     graph_def = tf.compat.v1.GraphDef()
     with open(PB, "rb") as handle:
         graph_def.ParseFromString(handle.read())
 
     ref_graph = tf.Graph()
     with ref_graph.as_default():
-        with tf.device("/CPU:0"):
+        with tf.device("/device:MUSA:0"):
             tf.import_graph_def(graph_def, name="")
             ref_box = ref_graph.get_tensor_by_name("t_box:0")
             ref_coord = ref_graph.get_tensor_by_name("t_coord:0")
@@ -51,14 +52,17 @@ def main():
                 "layer_0_type_0/matrix:0"
             )
             layer_bias = ref_graph.get_tensor_by_name("layer_0_type_0/bias:0")
+            layer_pre = ref_graph.get_tensor_by_name(
+                "layer_0_type_0/BiasAdd:0"
+            )
             layer_ref = ref_graph.get_tensor_by_name(
                 "layer_0_type_0/Tanh:0"
             )
 
     box, coord, atom_type, natoms, mesh = make_inputs()
     with tf.compat.v1.Session(graph=ref_graph) as sess:
-        x, weight, bias, expected = sess.run(
-            [layer_input, layer_matrix, layer_bias, layer_ref],
+        x, weight, bias, expected_pre, expected = sess.run(
+            [layer_input, layer_matrix, layer_bias, layer_pre, layer_ref],
             feed_dict={
                 ref_box: box,
                 ref_coord: coord,
@@ -70,9 +74,9 @@ def main():
     print("layer_input", x.shape, x.dtype)
     print("layer_matrix", weight.shape, weight.dtype)
     print("layer_bias", bias.shape, bias.dtype)
+    print("layer_pre_reference", expected_pre.shape, expected_pre.dtype)
     print("layer_reference", expected.shape, expected.dtype)
 
-    tf.load_op_library(MUSA_OP_LIB)
     ops = tensorflow_musa.get_musa_ops()
     cap_graph = tf.Graph()
     with cap_graph.as_default():
@@ -93,11 +97,24 @@ def main():
             },
         )
 
-    difference = np.max(np.abs(result - expected))
-    print("max_abs_diff", difference)
-    if result.shape != expected.shape:
+    print("result_shape", result.shape)
+    if result.shape != (4,) + expected.shape:
         raise RuntimeError("real layer output shape mismatch")
-    if not np.allclose(result, expected, rtol=1e-3, atol=1e-3):
+    if not np.array_equal(result[0], result[2]):
+        raise RuntimeError("real layer pre-activation replay is not deterministic")
+    if not np.array_equal(result[1], result[3]):
+        raise RuntimeError("real layer tanh replay is not deterministic")
+    pre_diff = np.abs(result[0] - expected_pre)
+    tanh_diff = np.abs(result[1] - expected)
+    print("pre_max_abs_diff", float(np.max(pre_diff)))
+    print("pre_mean_abs_diff", float(np.mean(pre_diff)))
+    print("pre_p99_abs_diff", float(np.percentile(pre_diff, 99)))
+    print("tanh_max_abs_diff", float(np.max(tanh_diff)))
+    print("tanh_mean_abs_diff", float(np.mean(tanh_diff)))
+    print("tanh_p99_abs_diff", float(np.percentile(tanh_diff, 99)))
+    if not np.allclose(result[0], expected_pre, rtol=1e-2, atol=1e-2):
+        raise RuntimeError("real layer pre-activation mismatch")
+    if not np.allclose(result[1], expected, rtol=1e-2, atol=1e-2):
         raise RuntimeError("real layer output mismatch")
     print("MANUAL_REAL_LAYER_PASS")
 

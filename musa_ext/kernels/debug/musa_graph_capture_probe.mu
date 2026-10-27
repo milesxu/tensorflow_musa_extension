@@ -71,11 +71,13 @@ extern "C" __global__ void MusaManualGraphBiasTanhKernel(
 }
 
 extern "C" __global__ void MusaManualGraphBiasTanhFloatKernel(
-    const float* input, const float* bias, float* output,
+    const float* input, const float* bias, float* pre, float* output,
     int elements, int width) {
   const int idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (idx < elements) {
-    output[idx] = tanhf(input[idx] + bias[idx % width]);
+    const float value = input[idx] + bias[idx % width];
+    pre[idx] = value;
+    output[idx] = tanhf(value);
   }
 }
 

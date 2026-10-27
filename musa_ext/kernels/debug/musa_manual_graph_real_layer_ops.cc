@@ -60,13 +60,14 @@ class MusaManualGraphRealLayerOp : public OpKernel {
 
     Tensor* output = nullptr;
     OP_REQUIRES_OK(
-        ctx, ctx->allocate_output(0, TensorShape({kM, kN}), &output));
+        ctx, ctx->allocate_output(0, TensorShape({4, kM, kN}), &output));
     musaStream_t stream = GetMusaStreamByCtx(ctx);
 
     float* input_dev = nullptr;
     float* matrix_dev = nullptr;
     float* bias_dev = nullptr;
     float* gemm_dev = nullptr;
+    float* pre_dev = nullptr;
     float* output_dev = nullptr;
     unsigned int* counter = nullptr;
     mublasHandle_t handle = nullptr;
@@ -108,6 +109,7 @@ class MusaManualGraphRealLayerOp : public OpKernel {
       free_buffer(reinterpret_cast<void**>(&matrix_dev));
       free_buffer(reinterpret_cast<void**>(&bias_dev));
       free_buffer(reinterpret_cast<void**>(&gemm_dev));
+      free_buffer(reinterpret_cast<void**>(&pre_dev));
       free_buffer(reinterpret_cast<void**>(&output_dev));
       free_buffer(reinterpret_cast<void**>(&counter));
     };
@@ -128,6 +130,9 @@ class MusaManualGraphRealLayerOp : public OpKernel {
     if (!status.ok()) return fail(status);
     status = alloc(&gemm_dev, sizeof(float) * kElements,
                    "musaMalloc(gemm)");
+    if (!status.ok()) return fail(status);
+    status = alloc(&pre_dev, sizeof(float) * kElements,
+                   "musaMalloc(pre)");
     if (!status.ok()) return fail(status);
     status = alloc(&output_dev, sizeof(float) * kElements,
                    "musaMalloc(output)");
@@ -221,10 +226,13 @@ class MusaManualGraphRealLayerOp : public OpKernel {
     }
     const float* bt_input = gemm_dev;
     const float* bt_bias = bias_dev;
+    float* bt_pre = pre_dev;
     float* bt_output = output_dev;
     int elements = kElements;
     int width = kN;
-    void* bt_args[] = {&bt_input, &bt_bias, &bt_output, &elements, &width};
+    void* bt_args[] = {
+        &bt_input, &bt_bias, &bt_pre, &bt_output, &elements, &width,
+    };
     musaKernelNodeParams bt_params{};
     bt_params.func = bias_tanh_kernel;
     bt_params.gridDim = dim3((kElements + 255) / 256, 1, 1);
@@ -263,13 +271,32 @@ class MusaManualGraphRealLayerOp : public OpKernel {
     status = CheckMusa(musaStreamSynchronize(stream),
                        "musaStreamSynchronize(replay1)");
     if (!status.ok()) return fail(status);
+    status = CheckMusa(
+        musaMemcpyAsync(output->flat<float>().data(), pre_dev,
+                        sizeof(float) * kElements, musaMemcpyDeviceToDevice,
+                        stream),
+        "musaMemcpyAsync(pre1)");
+    if (!status.ok()) return fail(status);
+    status = CheckMusa(
+        musaMemcpyAsync(output->flat<float>().data() + kElements, output_dev,
+                        sizeof(float) * kElements, musaMemcpyDeviceToDevice,
+                        stream),
+        "musaMemcpyAsync(output1)");
+    if (!status.ok()) return fail(status);
     status = CheckMusa(musaGraphLaunch(exec, stream), "musaGraphLaunch(2)");
     if (!status.ok()) return fail(status);
     status = CheckMusa(musaStreamSynchronize(stream),
                        "musaStreamSynchronize(replay2)");
     if (!status.ok()) return fail(status);
     status = CheckMusa(
-        musaMemcpyAsync(output->flat<float>().data(), output_dev,
+        musaMemcpyAsync(output->flat<float>().data() + 2 * kElements, pre_dev,
+                        sizeof(float) * kElements, musaMemcpyDeviceToDevice,
+                        stream),
+        "musaMemcpyAsync(pre2)");
+    if (!status.ok()) return fail(status);
+    status = CheckMusa(
+        musaMemcpyAsync(output->flat<float>().data() + 3 * kElements,
+                        output_dev,
                         sizeof(float) * kElements, musaMemcpyDeviceToDevice,
                         stream),
         "musaMemcpyAsync(real_layer_output)");
@@ -304,7 +331,7 @@ REGISTER_OP("MusaManualGraphRealLayer")
     .Output("output: float")
     .SetIsStateful()
     .SetShapeFn([](shape_inference::InferenceContext* c) {
-      c->set_output(0, c->MakeShape({kM, kN}));
+      c->set_output(0, c->MakeShape({4, kM, kN}));
       return OkStatus();
     });
 
