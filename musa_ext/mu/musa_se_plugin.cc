@@ -26,7 +26,9 @@ limitations under the License.
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <vector>
 
 #include "mu/device/musa_memset.h"
 #include "mu/musa_plugin_sp_stream.h"
@@ -362,6 +364,39 @@ void plugin_se_destroy_stream(const SP_Device* device, SP_Stream stream) {
 // musaStreamWaitEvent() queues the wait; keep the temporary event alive until
 // the dependent stream has consumed the wait.
 
+struct CaptureOwnedEvent {
+  musaEvent_t event;
+  unsigned long long capture_id;
+};
+
+bool GetCaptureId(musaStream_t stream, unsigned long long* capture_id) {
+  musaStreamCaptureStatus capture_status = musaStreamCaptureStatusNone;
+  unsigned long long stream_capture_id = 0;
+  const musaError_t err =
+      musaStreamGetCaptureInfo(stream, &capture_status, &stream_capture_id);
+  if (err != musaSuccess) {
+    LOG(WARNING) << "musaStreamGetCaptureInfo failed: "
+                 << musaGetErrorString(err);
+    return false;
+  }
+  if (capture_status != musaStreamCaptureStatusActive) {
+    return false;
+  }
+  *capture_id = stream_capture_id;
+  return true;
+}
+
+// PROBE ONLY: graph nodes retain raw event handles. Keep captured events alive
+// for the process lifetime until the capture implementation has an explicit
+// graph-lifetime ownership and destruction protocol.
+void RetainCaptureOwnedEvent(musaEvent_t event, unsigned long long capture_id) {
+  static std::mutex* mutex = new std::mutex;
+  static std::vector<CaptureOwnedEvent>* events =
+      new std::vector<CaptureOwnedEvent>;
+  std::lock_guard<std::mutex> lock(*mutex);
+  events->push_back({event, capture_id});
+}
+
 void plugin_se_create_stream_dependency(const SP_Device* device,
                                         SP_Stream dependent, SP_Stream other,
                                         TF_Status* status) {
@@ -392,6 +427,22 @@ void plugin_se_create_stream_dependency(const SP_Device* device,
     musaEventDestroy(event);
     ::tensorflow::musa::runtime::SetStatusFromMusa(status, err,
                                                    "musaStreamWaitEvent");
+    return;
+  }
+
+  unsigned long long other_capture_id = 0;
+  unsigned long long dependent_capture_id = 0;
+  const bool other_capturing = GetCaptureId(other->stream, &other_capture_id);
+  const bool dependent_capturing =
+      GetCaptureId(dependent->stream, &dependent_capture_id);
+  if (other_capturing || dependent_capturing) {
+    const unsigned long long capture_id =
+        other_capturing ? other_capture_id : dependent_capture_id;
+    RetainCaptureOwnedEvent(event, capture_id);
+    LOG(INFO) << "Retained capture dependency event: capture_id=" << capture_id
+              << " other_capturing=" << other_capturing
+              << " dependent_capturing=" << dependent_capturing;
+    TF_SetStatus(status, TF_OK, "");
     return;
   }
 

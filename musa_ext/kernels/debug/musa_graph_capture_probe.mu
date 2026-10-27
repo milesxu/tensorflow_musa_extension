@@ -29,3 +29,7 @@ extern "C" void LaunchMusaGraphCounterTick(unsigned int* counter,
                                            musaStream_t stream) {
   MusaGraphCounterTickKernel<<<1, 1, 0, stream>>>(counter);
 }
+
+extern "C" void* MusaGraphCounterTickKernelAddress() {
+  return reinterpret_cast<void*>(MusaGraphCounterTickKernel);
+}
