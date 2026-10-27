@@ -23,6 +23,8 @@ extern "C" void LaunchMusaManualGraphBiasFloat(
 extern "C" void LaunchMusaManualGraphResidualFloat(
     const float* previous, const float* current, const float* idt,
     float* output, int elements, int width, musaStream_t stream);
+extern "C" void LaunchMusaManualGraphPoisonFloat(
+    float* data, int elements, float value, musaStream_t stream);
 extern "C" void* MusaGraphCounterTickKernelAddress();
 extern "C" void* MusaManualGraphBiasTanhFloatKernelAddress();
 extern "C" void* MusaManualGraphBiasFloatKernelAddress();
@@ -36,6 +38,7 @@ constexpr int kM = 1536;
 constexpr int kK = 1600;
 constexpr int kH = 240;
 constexpr int kActive = kM * kH;
+constexpr float kPoisonValue = -123456.0f;
 
 Status CheckMusa(musaError_t status, const char* call) {
   if (status == musaSuccess) return OkStatus();
@@ -131,28 +134,68 @@ class MusaManualGraphFullFittingOp : public OpKernel {
       if (stream != nullptr) {
         musaStreamCaptureStatus capture_status = musaStreamCaptureStatusNone;
         if (musaStreamIsCapturing(stream, &capture_status) == musaSuccess &&
-            capture_status == musaStreamCaptureStatusActive) {
+            capture_status != musaStreamCaptureStatusNone) {
           musaGraph_t aborted = nullptr;
-          musaStreamEndCapture(stream, &aborted);
-          if (aborted != nullptr) musaGraphDestroy(aborted);
+          const musaError_t end_status =
+              musaStreamEndCapture(stream, &aborted);
+          if (end_status != musaSuccess) {
+            std::fprintf(stderr,
+                         "FULL_FITTING_CLEANUP EndCapture failed err=%d\n",
+                         static_cast<int>(end_status));
+          }
+          if (aborted != nullptr) {
+            const musaError_t destroy_status = musaGraphDestroy(aborted);
+            if (destroy_status != musaSuccess) {
+              std::fprintf(stderr,
+                           "FULL_FITTING_CLEANUP aborted destroy failed err=%d\n",
+                           static_cast<int>(destroy_status));
+            }
+          }
         }
-        musaStreamSynchronize(stream);
+        const musaError_t sync_status = musaStreamSynchronize(stream);
+        if (sync_status != musaSuccess) {
+          std::fprintf(stderr,
+                       "FULL_FITTING_CLEANUP sync failed err=%d; "
+                       "skip device teardown\n",
+                       static_cast<int>(sync_status));
+          return;
+        }
       }
       if (exec != nullptr) {
-        musaGraphExecDestroy(exec);
+        const musaError_t destroy_status = musaGraphExecDestroy(exec);
+        if (destroy_status != musaSuccess) {
+          std::fprintf(stderr,
+                       "FULL_FITTING_CLEANUP exec destroy failed err=%d\n",
+                       static_cast<int>(destroy_status));
+        }
         exec = nullptr;
       }
       if (graph != nullptr) {
-        musaGraphDestroy(graph);
+        const musaError_t destroy_status = musaGraphDestroy(graph);
+        if (destroy_status != musaSuccess) {
+          std::fprintf(stderr,
+                       "FULL_FITTING_CLEANUP graph destroy failed err=%d\n",
+                       static_cast<int>(destroy_status));
+        }
         graph = nullptr;
       }
       if (handle != nullptr) {
-        mublasDestroy(handle);
+        const mublasStatus_t destroy_status = mublasDestroy(handle);
+        if (destroy_status != MUBLAS_STATUS_SUCCESS) {
+          std::fprintf(stderr,
+                       "FULL_FITTING_CLEANUP mublas destroy failed status=%d\n",
+                       static_cast<int>(destroy_status));
+        }
         handle = nullptr;
       }
       auto free_buffer = [](void** ptr) {
         if (*ptr != nullptr) {
-          musaFree(*ptr);
+          const musaError_t free_status = musaFree(*ptr);
+          if (free_status != musaSuccess) {
+            std::fprintf(stderr,
+                         "FULL_FITTING_CLEANUP free failed err=%d ptr=%p\n",
+                         static_cast<int>(free_status), *ptr);
+          }
           *ptr = nullptr;
         }
       };
@@ -351,6 +394,47 @@ class MusaManualGraphFullFittingOp : public OpKernel {
                        "musaStreamEndCapture(full_fitting)");
     if (!status.ok()) return fail(status);
 
+    auto poison = [&](float* buffer, int elements, const char* name) {
+      LaunchMusaManualGraphPoisonFloat(buffer, elements, kPoisonValue, stream);
+      return CheckMusa(musaGetLastError(), name);
+    };
+    Status poison_status = poison(h0g_dev, kActive, "poison(h0g)");
+    if (!poison_status.ok()) return fail(poison_status);
+    poison_status = poison(h0_dev, kActive, "poison(h0)");
+    if (!poison_status.ok()) return fail(poison_status);
+    poison_status = poison(h1g_dev, kActive, "poison(h1g)");
+    if (!poison_status.ok()) return fail(poison_status);
+    poison_status = poison(h1_dev, kActive, "poison(h1)");
+    if (!poison_status.ok()) return fail(poison_status);
+    poison_status = poison(h2g_dev, kActive, "poison(h2g)");
+    if (!poison_status.ok()) return fail(poison_status);
+    poison_status = poison(h2_dev, kActive, "poison(h2)");
+    if (!poison_status.ok()) return fail(poison_status);
+    poison_status = poison(add2_dev, kActive, "poison(add2)");
+    if (!poison_status.ok()) return fail(poison_status);
+    poison_status = poison(add3_dev, kActive, "poison(add3)");
+    if (!poison_status.ok()) return fail(poison_status);
+    poison_status = poison(fg_dev, kM, "poison(fg)");
+    if (!poison_status.ok()) return fail(poison_status);
+    poison_status = poison(final_dev, kM, "poison(final)");
+    if (!poison_status.ok()) return fail(poison_status);
+    poison_status = poison(replay1_dev, kM, "poison(replay1)");
+    if (!poison_status.ok()) return fail(poison_status);
+    status = CheckMusa(musaStreamSynchronize(stream), "sync(poison)");
+    if (!status.ok()) return fail(status);
+
+    std::vector<float> poisoned_output(kM);
+    status = CheckMusa(musaMemcpy(poisoned_output.data(), final_dev,
+                                  sizeof(float) * kM,
+                                  musaMemcpyDeviceToHost),
+                       "musaMemcpy(poison_check)");
+    if (!status.ok()) return fail(status);
+    for (float value : poisoned_output) {
+      if (value != kPoisonValue) {
+        return fail(errors::Internal("full fitting poison check failed"));
+      }
+    }
+
     size_t node_count = 0;
     status = CheckMusa(musaGraphGetNodes(graph, nullptr, &node_count),
                        "musaGraphGetNodes(full_fitting)");
@@ -363,6 +447,11 @@ class MusaManualGraphFullFittingOp : public OpKernel {
     if (!status.ok()) return fail(status);
     size_t kernel_count = 0;
     size_t mublas_kernel_count = 0;
+    size_t matrix_trans_kernel_count = 0;
+    size_t descriptor_copy_kernel_count = 0;
+    size_t tme_sgemm_kernel_count = 0;
+    size_t small_gemm_kernel_count = 0;
+    size_t unknown_kernel_count = 0;
     size_t bias_tanh_kernel_count = 0;
     size_t bias_kernel_count = 0;
     size_t residual_kernel_count = 0;
@@ -401,6 +490,18 @@ class MusaManualGraphFullFittingOp : public OpKernel {
         ++tick_kernel_count;
       } else {
         ++mublas_kernel_count;
+        if (std::strstr(name, "matrixTrans_Kernel") != nullptr) {
+          ++matrix_trans_kernel_count;
+        } else if (std::strstr(name, "copy_tensor_descriptors") != nullptr) {
+          ++descriptor_copy_kernel_count;
+        } else if (std::strstr(name, "sgemm_nt_256_128x256_FullBC_ph1_tme") !=
+                   nullptr) {
+          ++tme_sgemm_kernel_count;
+        } else if (std::strstr(name, "gemm_small_32x32_kernel") != nullptr) {
+          ++small_gemm_kernel_count;
+        } else {
+          ++unknown_kernel_count;
+        }
       }
       std::fprintf(
           stderr,
@@ -412,12 +513,20 @@ class MusaManualGraphFullFittingOp : public OpKernel {
     }
     if (mublas_kernel_count != 6 || bias_tanh_kernel_count != 3 ||
         bias_kernel_count != 1 || residual_kernel_count != 2 ||
-        tick_kernel_count != 1) {
+        tick_kernel_count != 1 || matrix_trans_kernel_count != 1 ||
+        descriptor_copy_kernel_count != 1 || tme_sgemm_kernel_count != 1 ||
+        small_gemm_kernel_count != 3 || unknown_kernel_count != 0 ||
+        kernel_count != 13 || fetched != node_count) {
       return fail(errors::Internal(
           "full fitting kernel composition mismatch: mublas=",
           mublas_kernel_count, " bias_tanh=", bias_tanh_kernel_count,
           " bias=", bias_kernel_count, " residual=", residual_kernel_count,
-          " tick=", tick_kernel_count));
+          " tick=", tick_kernel_count, " matrix_trans=",
+          matrix_trans_kernel_count, " descriptor_copy=",
+          descriptor_copy_kernel_count, " tme_sgemm=",
+          tme_sgemm_kernel_count, " small_gemm=", small_gemm_kernel_count,
+          " unknown=", unknown_kernel_count, " kernels=", kernel_count,
+          " nodes=", node_count, " fetched=", fetched));
     }
 
     status = CheckMusa(musaGraphInstantiate(&exec, graph, 0),
@@ -480,7 +589,7 @@ class MusaManualGraphFullFittingOp : public OpKernel {
     std::fprintf(stderr,
                  "MANUAL_FULL_FITTING_PROBE nodes=%zu kernels=%zu "
                  "mublas=%zu bias_tanh=%zu bias=%zu residual=%zu tick=2 "
-                 "shape=%dx1 replay_bitwise=1 finite=1\n",
+                 "poisoned=1 shape=%dx1 replay_bitwise=1 finite=1\n",
                  node_count, kernel_count, mublas_kernel_count,
                  bias_tanh_kernel_count, bias_kernel_count,
                  residual_kernel_count, kM);

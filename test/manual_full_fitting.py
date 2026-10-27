@@ -1,3 +1,6 @@
+import hashlib
+from pathlib import Path
+
 import numpy as np
 import tensorflow as tf
 import tensorflow_musa
@@ -8,6 +11,14 @@ CPU_OP_LIB = "/data/mingxu/results/ningde_v8_20261021/tf-musa-mpi-v8-20261027/in
 MUSA_OP_LIB = "/data/mingxu/results/ningde_v8_20261021/tf-musa-mpi-v8-20261027/install-deepmd/lib/libdeepmd_op_musa.so"
 NLOC = 1536
 NALL = 6787
+
+
+def file_sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def make_inputs():
@@ -76,6 +87,11 @@ def diff_stats(label, actual, expected):
 
 
 def main():
+    plugin_path = Path(tensorflow_musa.__file__).with_name("libmusa_plugin.so")
+    print("tensorflow_version", tf.__version__)
+    for path in (plugin_path, PB, CPU_OP_LIB, MUSA_OP_LIB):
+        print("sha256", path, file_sha256(path))
+
     tf.load_op_library(CPU_OP_LIB)
     tf.load_op_library(MUSA_OP_LIB)
     graph_def = tf.compat.v1.GraphDef()

@@ -99,6 +99,14 @@ extern "C" __global__ void MusaManualGraphResidualFloatKernel(
   }
 }
 
+extern "C" __global__ void MusaManualGraphPoisonFloatKernel(
+    float* data, int elements, float value) {
+  for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < elements;
+       idx += blockDim.x * gridDim.x) {
+    data[idx] = value;
+  }
+}
+
 extern "C" void* MusaManualGraphReshapeKernelAddress() {
   return reinterpret_cast<void*>(MusaManualGraphReshapeKernel);
 }
@@ -127,6 +135,10 @@ extern "C" void* MusaManualGraphResidualFloatKernelAddress() {
   return reinterpret_cast<void*>(MusaManualGraphResidualFloatKernel);
 }
 
+extern "C" void* MusaManualGraphPoisonFloatKernelAddress() {
+  return reinterpret_cast<void*>(MusaManualGraphPoisonFloatKernel);
+}
+
 extern "C" void LaunchMusaManualGraphBiasTanhFloat(
     const float* input, const float* bias, float* pre, float* output,
     int elements, int width, musaStream_t stream) {
@@ -146,4 +158,10 @@ extern "C" void LaunchMusaManualGraphResidualFloat(
     float* output, int elements, int width, musaStream_t stream) {
   MusaManualGraphResidualFloatKernel<<<(elements + 255) / 256, 256, 0, stream>>>(
       previous, current, idt, output, elements, width);
+}
+
+extern "C" void LaunchMusaManualGraphPoisonFloat(
+    float* data, int elements, float value, musaStream_t stream) {
+  MusaManualGraphPoisonFloatKernel<<<(elements + 255) / 256, 256, 0, stream>>>(
+      data, elements, value);
 }
