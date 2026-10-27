@@ -15,6 +15,8 @@ def main():
     with tf.device("/device:MUSA:0"):
         y = ops.musa_graph_capture_probe(x)
     result = y.numpy()
+    # Probe initializes y=0, captures one accumulate kernel, and replays twice.
+    # A capture-time execution would incorrectly add a third increment.
     expected = (np.arange(16, dtype=np.float32) + 1.0) * 2.0
     print("result", result.tolist())
     print("expected", expected.tolist())

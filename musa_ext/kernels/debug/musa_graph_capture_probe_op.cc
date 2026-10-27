@@ -39,6 +39,10 @@ class MusaGraphCaptureProbeOp : public OpKernel {
                               static_cast<int>(status));
     };
 
+    OP_REQUIRES_OK(
+        ctx, check(musaMemsetAsync(output->flat<float>().data(), 0,
+                                   n * sizeof(float), stream),
+                   "musaMemsetAsync"));
     OP_REQUIRES_OK(ctx, check(musaStreamBeginCapture(
                              stream, musaStreamCaptureModeRelaxed),
                              "musaStreamBeginCapture"));
@@ -54,7 +58,9 @@ class MusaGraphCaptureProbeOp : public OpKernel {
         ctx, check(musaGraphInstantiate(&graph_exec, graph, 0),
                    "musaGraphInstantiate"));
     OP_REQUIRES_OK(
-        ctx, check(musaGraphLaunch(graph_exec, stream), "musaGraphLaunch"));
+        ctx, check(musaGraphLaunch(graph_exec, stream), "musaGraphLaunch#1"));
+    OP_REQUIRES_OK(
+        ctx, check(musaGraphLaunch(graph_exec, stream), "musaGraphLaunch#2"));
     OP_REQUIRES_OK(
         ctx, check(musaStreamSynchronize(stream), "musaStreamSynchronize"));
 
