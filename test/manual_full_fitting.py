@@ -354,8 +354,12 @@ def main():
             actual, feed_dict=dict(zip(placeholders, arrays_a))
         )
         end_a3 = time.perf_counter()
+    if not np.array_equal(result_a1, result_a2):
+        raise RuntimeError("cache miss/hit A output changed")
     if not np.array_equal(result_a2, result_a3):
         raise RuntimeError("cached exec repeat A output changed")
+    if not np.array_equal(grad_a1, grad_a2):
+        raise RuntimeError("cache miss/hit A gradient changed")
     if not np.array_equal(grad_a2, grad_a3):
         raise RuntimeError("cached exec repeat A gradient changed")
     if np.array_equal(result_a2, result_b):
@@ -366,9 +370,9 @@ def main():
     print("result_shape", result_a1.shape)
     print("gradient_shape", grad_a1.shape)
     print("cache_calls", 4)
-    print("cache_hit_repeat_a_bitwise", True)
+    print("cache_repeat_a_bitwise", True)
     print("cache_input_sensitivity", True)
-    print("gradient_hit_repeat_a_bitwise", True)
+    print("gradient_repeat_a_bitwise", True)
     print("gradient_input_sensitivity", True)
     cache_miss_ms = (start_b - start_a1) * 1e3
     cache_hit_b_ms = (start_a2 - start_b) * 1e3

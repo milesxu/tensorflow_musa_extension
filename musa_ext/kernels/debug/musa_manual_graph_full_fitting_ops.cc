@@ -112,8 +112,6 @@ struct FullFittingCache {
   float* add3_dev = nullptr;
   float* fg_dev = nullptr;
   float* final_dev = nullptr;
-  std::vector<float> first_final_host;
-  std::vector<float> first_grad_host;
   float* gt2_dev = nullptr;
   float* tmp_dev = nullptr;
   float* g2_dev = nullptr;
@@ -303,6 +301,8 @@ class MusaManualGraphFullFittingOp : public OpKernel {
 
     std::lock_guard<std::mutex> lock(mu_);
     const bool debug_sync = std::getenv("MUSA_FITTING_DEBUG_SYNC") != nullptr;
+    const bool poison_hits =
+        std::getenv("MUSA_FITTING_POISON_HITS") != nullptr;
     const bool cache_miss = cache_ == nullptr;
     std::unique_ptr<FullFittingCache> pending_cache;
     FullFittingCache* cache = cache_.get();
@@ -589,52 +589,6 @@ class MusaManualGraphFullFittingOp : public OpKernel {
     if (!status.ok()) return fail(status);
     status = CheckMusa(musaStreamSynchronize(stream), "sync(warmup)");
     if (!status.ok()) return fail(status);
-    if (debug_sync) {
-      std::fprintf(stderr,
-                   "FULL_FITTING_FIRST_PTR final=%p grad_x=%p\n",
-                   final_dev, grad_x_dev);
-      std::vector<float> warmup_final(kM);
-      status = CheckMusa(
-          musaMemcpy(warmup_final.data(), final_dev, sizeof(float) * kM,
-                     musaMemcpyDeviceToHost),
-          "musaMemcpy(warmup_final)");
-      if (!status.ok()) return fail(status);
-      const float warmup_min =
-          *std::min_element(warmup_final.begin(), warmup_final.end());
-      const float warmup_max =
-          *std::max_element(warmup_final.begin(), warmup_final.end());
-      std::fprintf(stderr,
-                   "FULL_FITTING_WARMUP final_min=%.9g final_max=%.9g "
-                   "final_first=%.9g,%.9g,%.9g\n",
-                   warmup_min, warmup_max, warmup_final[0],
-                   warmup_final[1], warmup_final[2]);
-    }
-    cache->first_final_host.resize(kM);
-    cache->first_grad_host.resize(kGradElements);
-    status = CheckMusa(
-        musaMemcpy(cache->first_final_host.data(), final_dev,
-                   sizeof(float) * kM, musaMemcpyDeviceToHost),
-        "copy(first_final_host)");
-    if (!status.ok()) return fail(status);
-    status = CheckMusa(
-        musaMemcpy(cache->first_grad_host.data(), grad_x_dev,
-                   sizeof(float) * kGradElements,
-                   musaMemcpyDeviceToHost),
-        "copy(first_grad_host)");
-    if (!status.ok()) return fail(status);
-    if (debug_sync) {
-      const float saved_min =
-          *std::min_element(cache->first_final_host.begin(),
-                            cache->first_final_host.end());
-      const float saved_max =
-          *std::max_element(cache->first_final_host.begin(),
-                            cache->first_final_host.end());
-      std::fprintf(stderr,
-                   "FULL_FITTING_SAVED final_min=%.9g final_max=%.9g "
-                   "final_first=%.9g,%.9g,%.9g\n",
-                   saved_min, saved_max, cache->first_final_host[0],
-                   cache->first_final_host[1], cache->first_final_host[2]);
-    }
     status = CheckMusa(musaMemset(counter, 0, sizeof(*counter)),
                        "musaMemset(counter_after_warmup)");
     if (!status.ok()) return fail(status);
@@ -679,11 +633,11 @@ class MusaManualGraphFullFittingOp : public OpKernel {
     if (!poison_status.ok()) return fail(poison_status);
     poison_status = poison(final_dev, kM, "poison(final)");
     if (!poison_status.ok()) return fail(poison_status);
-    poison_status = poison(w0t_dev, kGradElements, "poison(w0t)");
+    poison_status = poison(w0t_dev, kH * kK, "poison(w0t)");
     if (!poison_status.ok()) return fail(poison_status);
-    poison_status = poison(w1t_dev, kActive, "poison(w1t)");
+    poison_status = poison(w1t_dev, kH * kH, "poison(w1t)");
     if (!poison_status.ok()) return fail(poison_status);
-    poison_status = poison(w2t_dev, kActive, "poison(w2t)");
+    poison_status = poison(w2t_dev, kH * kH, "poison(w2t)");
     if (!poison_status.ok()) return fail(poison_status);
     poison_status = poison(gt2_dev, kActive, "poison(gt2)");
     if (!poison_status.ok()) return fail(poison_status);
@@ -911,8 +865,59 @@ class MusaManualGraphFullFittingOp : public OpKernel {
     cache_ = std::move(pending_cache);
     }
 
-    if (!cache_miss) {
-      status = CheckMusa(musaGraphLaunch(exec, stream), "musaGraphLaunch");
+    if (!cache_miss && poison_hits) {
+      auto poison_hit = [&](float* buffer, int elements, const char* name) {
+        LaunchMusaManualGraphPoisonFloat(
+            buffer, elements, kPoisonValue, stream);
+        return CheckMusa(musaGetLastError(), name);
+      };
+      Status poison_status = poison_hit(h0g_dev, kActive, "poison_hit(h0g)");
+      if (!poison_status.ok()) return fail(poison_status);
+      poison_status = poison_hit(h0_dev, kActive, "poison_hit(h0)");
+      if (!poison_status.ok()) return fail(poison_status);
+      poison_status = poison_hit(h1g_dev, kActive, "poison_hit(h1g)");
+      if (!poison_status.ok()) return fail(poison_status);
+      poison_status = poison_hit(h1_dev, kActive, "poison_hit(h1)");
+      if (!poison_status.ok()) return fail(poison_status);
+      poison_status = poison_hit(h2g_dev, kActive, "poison_hit(h2g)");
+      if (!poison_status.ok()) return fail(poison_status);
+      poison_status = poison_hit(h2_dev, kActive, "poison_hit(h2)");
+      if (!poison_status.ok()) return fail(poison_status);
+      poison_status = poison_hit(add2_dev, kActive, "poison_hit(add2)");
+      if (!poison_status.ok()) return fail(poison_status);
+      poison_status = poison_hit(add3_dev, kActive, "poison_hit(add3)");
+      if (!poison_status.ok()) return fail(poison_status);
+      poison_status = poison_hit(fg_dev, kActive, "poison_hit(fg)");
+      if (!poison_status.ok()) return fail(poison_status);
+      poison_status = poison_hit(final_dev, kM, "poison_hit(final)");
+      if (!poison_status.ok()) return fail(poison_status);
+      poison_status = poison_hit(w0t_dev, kH * kK, "poison_hit(w0t)");
+      if (!poison_status.ok()) return fail(poison_status);
+      poison_status = poison_hit(w1t_dev, kH * kH, "poison_hit(w1t)");
+      if (!poison_status.ok()) return fail(poison_status);
+      poison_status = poison_hit(w2t_dev, kH * kH, "poison_hit(w2t)");
+      if (!poison_status.ok()) return fail(poison_status);
+      poison_status = poison_hit(gt2_dev, kActive, "poison_hit(gt2)");
+      if (!poison_status.ok()) return fail(poison_status);
+      poison_status = poison_hit(tmp_dev, kActive, "poison_hit(tmp)");
+      if (!poison_status.ok()) return fail(poison_status);
+      poison_status = poison_hit(g2_dev, kActive, "poison_hit(g2)");
+      if (!poison_status.ok()) return fail(poison_status);
+      poison_status = poison_hit(gt1_dev, kActive, "poison_hit(gt1)");
+      if (!poison_status.ok()) return fail(poison_status);
+      poison_status = poison_hit(g1_dev, kActive, "poison_hit(g1)");
+      if (!poison_status.ok()) return fail(poison_status);
+      poison_status = poison_hit(gt0_dev, kActive, "poison_hit(gt0)");
+      if (!poison_status.ok()) return fail(poison_status);
+      poison_status =
+          poison_hit(grad_x_dev, kGradElements, "poison_hit(grad_x)");
+      if (!poison_status.ok()) return fail(poison_status);
+    }
+    status = CheckMusa(musaGraphLaunch(exec, stream), "musaGraphLaunch");
+    if (!status.ok()) return fail(status);
+    if (cache_miss) {
+      status = CheckMusa(
+          musaStreamSynchronize(stream), "sync(first_graph_launch)");
       if (!status.ok()) return fail(status);
     }
     if (debug_sync && !cache_miss) {
@@ -959,58 +964,31 @@ class MusaManualGraphFullFittingOp : public OpKernel {
       print_debug_buffer("g1", g1_dev);
       print_debug_buffer("gt0", gt0_dev);
     }
-    if (debug_sync && cache_miss) {
-      std::fprintf(stderr,
-                   "FULL_FITTING_PRE_OUTPUT host_final_min=%.9g "
-                   "host_final_max=%.9g host_final_first=%.9g,%.9g\n",
-                   *std::min_element(cache->first_final_host.begin(),
-                                     cache->first_final_host.end()),
-                   *std::max_element(cache->first_final_host.begin(),
-                                     cache->first_final_host.end()),
-                   cache->first_final_host[0],
-                   cache->first_final_host[1]);
-    }
-    if (cache_miss) {
-      status = CheckMusa(
-          musaMemcpy(output->flat<float>().data(),
-                     cache->first_final_host.data(),
-                     sizeof(float) * kM, musaMemcpyHostToDevice),
-          "copy(first_final_host_to_output)");
-      if (!status.ok()) return fail(status);
-      status = CheckMusa(
-          musaMemcpy(grad_output->flat<float>().data(),
-                     cache->first_grad_host.data(),
-                     sizeof(float) * kGradElements,
-                     musaMemcpyHostToDevice),
-          "copy(first_grad_host_to_output)");
-      if (!status.ok()) return fail(status);
-    } else {
-      status = CheckMusa(
-          musaMemcpyAsync(output->flat<float>().data(), final_dev,
-                          sizeof(float) * kM, musaMemcpyDeviceToDevice,
-                          stream),
-          "copy(final)");
-      if (!status.ok()) return fail(status);
-      status = CheckMusa(
-          musaMemcpyAsync(grad_output->flat<float>().data(), grad_x_dev,
-                          sizeof(float) * kGradElements,
-                          musaMemcpyDeviceToDevice, stream),
-          "copy(grad_x)");
-      if (!status.ok()) return fail(status);
-    }
+    status = CheckMusa(
+        musaMemcpyAsync(output->flat<float>().data(), final_dev,
+                        sizeof(float) * kM, musaMemcpyDeviceToDevice,
+                        stream),
+        "copy(final)");
+    if (!status.ok()) return fail(status);
+    status = CheckMusa(
+        musaMemcpyAsync(grad_output->flat<float>().data(), grad_x_dev,
+                        sizeof(float) * kGradElements,
+                        musaMemcpyDeviceToDevice, stream),
+        "copy(grad_x)");
+    if (!status.ok()) return fail(status);
     if (!cache_miss && debug_sync) {
       status = CheckMusa(
           musaStreamSynchronize(stream), "sync(debug_outputs)");
       if (!status.ok()) return fail(status);
     }
-    if (!cache_miss) ++cache->launch_count;
+    ++cache->launch_count;
     std::fprintf(stderr,
                  "FULL_FITTING_CACHE %s=1 exec_launch=%d nodes=%zu kernels=%zu "
                  "mublas=%zu bias_tanh=%zu bias=%zu residual=%zu "
                  "backward_h2=%zu add_vector=%zu add_matrix=%zu "
-                 "backward_h1=%zu backward_h0=%zu poisoned=%d "
-                 "energy_shape=%dx1 first_host_fallback=%d "
-                 "grad_shape=1x%dx%d\n",
+                 "backward_h1=%zu backward_h0=%zu "
+                 "poisoned_init=%d poisoned_hit=%d "
+                 "energy_shape=%dx1 grad_shape=1x%dx%d\n",
                  cache_miss ? "miss" : "hit", cache->launch_count,
                  cache->node_count, cache->kernel_count,
                  cache->mublas_kernel_count, cache->bias_tanh_kernel_count,
@@ -1019,8 +997,8 @@ class MusaManualGraphFullFittingOp : public OpKernel {
                  cache->add_vector_kernel_count,
                  cache->add_matrix_kernel_count,
                  cache->backward_h1_kernel_count,
-                 cache->backward_h0_kernel_count, cache_miss ? 1 : 0, kM,
-                 cache_miss ? 1 : 0, kM, kK);
+                 cache->backward_h0_kernel_count, cache_miss ? 1 : 0,
+                 poison_hits ? 1 : 0, kM, kM, kK);
   }
 
  private:
