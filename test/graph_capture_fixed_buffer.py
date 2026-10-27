@@ -117,6 +117,13 @@ def main():
         print("capture=PASS")
 
         try:
+            sess.run(capture_done, feed_dict={a_host: a0, b_host: b0})
+        except tf.errors.OpError as exc:
+            print("duplicate_capture_rejected", str(exc).splitlines()[0])
+        else:
+            raise RuntimeError("duplicate capture was not rejected")
+
+        try:
             sess.run(
                 bad_write_done,
                 feed_dict={a_host: a1, b_host: b1},
