@@ -56,8 +56,8 @@ def numpy_fitting_reference(arrays):
     return (add3 @ wf + bf).astype(np.float32)
 
 
-def numpy_fitting_gradient(arrays):
-    x, w0, b0, w1, b1, w2, b2, wf, _, idt1, idt2 = arrays
+def numpy_fitting_intermediates(arrays):
+    x, w0, b0, w1, b1, w2, b2, wf, bf, idt1, idt2 = arrays
     h0 = np.tanh(x @ w0 + b0).astype(np.float32)
     h1 = np.tanh(h0 @ w1 + b1).astype(np.float32)
     add2 = (h0 + h1 * idt1).astype(np.float32)
@@ -68,8 +68,23 @@ def numpy_fitting_gradient(arrays):
     gt1 = (g2 * idt1 * (1.0 - h1 * h1)).astype(np.float32)
     g1 = (gt1 @ w1.T + g2).astype(np.float32)
     gt0 = (g1 * (1.0 - h0 * h0)).astype(np.float32)
+    add3 = (add2 + h2 * idt2).astype(np.float32)
+    energy = (add3 @ wf + bf).astype(np.float32)
     grad_x = (gt0 @ w0.T).astype(np.float32)
-    return grad_x.reshape(1, NLOC, 1600)
+    return {
+        "g3": wf_vector.astype(np.float32),
+        "gt2": gt2,
+        "g2": g2,
+        "gt1": gt1,
+        "g1": g1,
+        "gt0": gt0,
+        "gx": grad_x,
+        "energy": energy,
+    }
+
+
+def numpy_fitting_gradient(arrays):
+    return numpy_fitting_intermediates(arrays)["gx"].reshape(1, NLOC, 1600)
 
 
 def diff_stats(label, actual, expected):

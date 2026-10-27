@@ -13,6 +13,7 @@
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <vector>
 
 extern "C" void LaunchMusaGraphCounterTick(unsigned int* counter,
@@ -887,7 +888,7 @@ class MusaManualGraphFullFittingOp : public OpKernel {
       if (!poison_status.ok()) return fail(poison_status);
       poison_status = poison_hit(add3_dev, kActive, "poison_hit(add3)");
       if (!poison_status.ok()) return fail(poison_status);
-      poison_status = poison_hit(fg_dev, kActive, "poison_hit(fg)");
+      poison_status = poison_hit(fg_dev, kM, "poison_hit(fg)");
       if (!poison_status.ok()) return fail(poison_status);
       poison_status = poison_hit(final_dev, kM, "poison_hit(final)");
       if (!poison_status.ok()) return fail(poison_status);
@@ -963,6 +964,51 @@ class MusaManualGraphFullFittingOp : public OpKernel {
       print_debug_buffer("gt1", gt1_dev);
       print_debug_buffer("g1", g1_dev);
       print_debug_buffer("gt0", gt0_dev);
+    }
+    const char* dump_dir = std::getenv("MUSA_FITTING_DUMP_DIR");
+    if (dump_dir != nullptr) {
+      status = CheckMusa(musaStreamSynchronize(stream), "sync(dump)");
+      if (!status.ok()) return fail(status);
+      auto dump_buffer = [&](const char* name, const float* buffer,
+                             size_t elements) -> Status {
+        std::vector<float> host(elements);
+        const musaError_t copy_status =
+            musaMemcpy(host.data(), buffer, sizeof(float) * elements,
+                       musaMemcpyDeviceToHost);
+        if (copy_status != musaSuccess) {
+          return errors::Internal("dump ", name, " copy failed err=",
+                                  static_cast<int>(copy_status));
+        }
+        const std::string path =
+            std::string(dump_dir) + "/" + name + ".bin";
+        std::FILE* file = std::fopen(path.c_str(), "wb");
+        if (file == nullptr) {
+          return errors::Internal("dump ", name, " open failed");
+        }
+        const size_t written =
+            std::fwrite(host.data(), sizeof(float), elements, file);
+        const int close_status = std::fclose(file);
+        if (written != elements || close_status != 0) {
+          return errors::Internal("dump ", name, " write failed");
+        }
+        return OkStatus();
+      };
+      status = dump_buffer("g3", wf_dev, kH);
+      if (!status.ok()) return fail(status);
+      status = dump_buffer("gt2", gt2_dev, kActive);
+      if (!status.ok()) return fail(status);
+      status = dump_buffer("g2", g2_dev, kActive);
+      if (!status.ok()) return fail(status);
+      status = dump_buffer("gt1", gt1_dev, kActive);
+      if (!status.ok()) return fail(status);
+      status = dump_buffer("g1", g1_dev, kActive);
+      if (!status.ok()) return fail(status);
+      status = dump_buffer("gt0", gt0_dev, kActive);
+      if (!status.ok()) return fail(status);
+      status = dump_buffer("gx", grad_x_dev, kGradElements);
+      if (!status.ok()) return fail(status);
+      status = dump_buffer("energy", final_dev, kM);
+      if (!status.ok()) return fail(status);
     }
     status = CheckMusa(
         musaMemcpyAsync(output->flat<float>().data(), final_dev,
