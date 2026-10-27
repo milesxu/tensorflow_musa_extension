@@ -199,13 +199,24 @@ Status InspectGraph(musaGraph_t graph, void* tick_kernel,
     if (is_tick) {
       ++tick_kernels;
     }
+    const char* kernel_name = "<unavailable>";
+    const musaError_t name_error = musaFuncGetName(&kernel_name, params.func);
+    if (name_error != musaSuccess) {
+      kernel_name = "<unavailable>";
+    }
+    musaFuncAttributes attributes{};
+    const musaError_t attr_error =
+        musaFuncGetAttributes(&attributes, params.func);
+    const int registers =
+        attr_error == musaSuccess ? attributes.numRegs : -1;
     std::fprintf(
         stderr,
-        "FIXED_GRAPH_KERNEL index=%zu func=%p tick=%d grid=(%u,%u,%u) "
-        "block=(%u,%u,%u) shared=%u\n",
-        i, params.func, is_tick ? 1 : 0, params.gridDim.x, params.gridDim.y,
-        params.gridDim.z, params.blockDim.x, params.blockDim.y,
-        params.blockDim.z, params.sharedMemBytes);
+        "FIXED_GRAPH_KERNEL index=%zu func=%p name=%s name_error=%d tick=%d "
+        "grid=(%u,%u,%u) block=(%u,%u,%u) shared=%u regs=%d attr_error=%d\n",
+        i, params.func, kernel_name, static_cast<int>(name_error),
+        is_tick ? 1 : 0, params.gridDim.x, params.gridDim.y, params.gridDim.z,
+        params.blockDim.x, params.blockDim.y, params.blockDim.z,
+        params.sharedMemBytes, registers, static_cast<int>(attr_error));
   }
 
   *node_count = count;

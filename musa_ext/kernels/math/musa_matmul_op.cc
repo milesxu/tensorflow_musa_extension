@@ -3,6 +3,9 @@
 
 #include <mublas.h>
 
+#include <atomic>
+#include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <limits>
 #include <type_traits>
@@ -19,9 +22,23 @@
 namespace tensorflow {
 namespace musa {
 
+namespace {
+
+double DoubleMatMulTimestamp() {
+  return std::chrono::duration<double>(
+             std::chrono::system_clock::now().time_since_epoch())
+      .count();
+}
+
+}  // namespace
+
 Status RunDoubleMatMul(OpKernelContext* ctx, const Tensor& a, const Tensor& b,
                        int64_t m, int64_t k, int64_t n, bool trans_a,
                        bool trans_b, const MatMulBCast& bcast, Tensor* out) {
+  static std::atomic<int> call_counter{0};
+  const int call_id = call_counter.fetch_add(1) + 1;
+  const bool log_timing = call_id <= 4;
+  const double enter_time = DoubleMatMulTimestamp();
   if (m < 0 || n < 0 || k < 0 ||
       m > std::numeric_limits<int>::max() ||
       n > std::numeric_limits<int>::max() ||
@@ -31,6 +48,7 @@ Status RunDoubleMatMul(OpKernelContext* ctx, const Tensor& a, const Tensor& b,
   }
 
   auto runtime = QueryMusaKernelRuntimeView(ctx);
+  const double handle_time = DoubleMatMulTimestamp();
   if (runtime.mublas_handle == nullptr) {
     return errors::Internal("MUSA mublas handle is unavailable");
   }
@@ -89,6 +107,18 @@ Status RunDoubleMatMul(OpKernelContext* ctx, const Tensor& a, const Tensor& b,
         a.flat<double>().data(), lda, static_cast<long long>(strided_a),
         &beta, out->flat<double>().data(), ldc,
         static_cast<long long>(c_stride), static_cast<int>(out_batch));
+    const double gemm_done = DoubleMatMulTimestamp();
+    if (log_timing) {
+      std::fprintf(
+          stderr,
+          "DOUBLE_MATMUL_TIMING call=%d m=%lld k=%lld n=%lld batch=%lld "
+          "path=strided enter=%.6f handle_ready=%.6f gemm_done=%.6f "
+          "handle_s=%.6f gemm_s=%.6f status=%d\n",
+          call_id, static_cast<long long>(m), static_cast<long long>(k),
+          static_cast<long long>(n), static_cast<long long>(out_batch),
+          enter_time, handle_time, gemm_done, handle_time - enter_time,
+          gemm_done - handle_time, static_cast<int>(status));
+    }
     if (status != MUBLAS_STATUS_SUCCESS) {
       return errors::Internal(
           "mublasDgemmStridedBatched failed. Status: ",
@@ -117,6 +147,18 @@ Status RunDoubleMatMul(OpKernelContext* ctx, const Tensor& a, const Tensor& b,
       return errors::Internal("MUSA mublasDgemm failed. Status: ",
                               static_cast<int>(status));
     }
+  }
+  const double gemm_done = DoubleMatMulTimestamp();
+  if (log_timing) {
+    std::fprintf(
+        stderr,
+        "DOUBLE_MATMUL_TIMING call=%d m=%lld k=%lld n=%lld batch=%lld "
+        "path=loop enter=%.6f handle_ready=%.6f gemm_done=%.6f "
+        "handle_s=%.6f gemm_s=%.6f\n",
+        call_id, static_cast<long long>(m), static_cast<long long>(k),
+        static_cast<long long>(n), static_cast<long long>(out_batch),
+        enter_time, handle_time, gemm_done, handle_time - enter_time,
+        gemm_done - handle_time);
   }
   return OkStatus();
 }
@@ -170,8 +212,13 @@ class MusaMatMulOp : public MusaOpKernel {
   bool IsExpensive() override { return true; }
 
   void Compute(OpKernelContext* ctx) override {
+    static std::atomic<int> compute_counter{0};
+    const int compute_id = compute_counter.fetch_add(1) + 1;
+    const bool log_compute = compute_id <= 4;
+    const double compute_enter = DoubleMatMulTimestamp();
     const Tensor& in0 = ctx->input(0);
     const Tensor& in1 = ctx->input(1);
+    const double inputs_done = DoubleMatMulTimestamp();
 
     MatMulBCast bcast(in0.shape().dim_sizes(), in1.shape().dim_sizes());
     OP_REQUIRES(ctx, bcast.IsValid(),
@@ -199,6 +246,7 @@ class MusaMatMulOp : public MusaOpKernel {
 
     Tensor* out = nullptr;
     OP_REQUIRES_OK(ctx, ctx->allocate_output(0, out_shape, &out));
+    const double allocate_done = DoubleMatMulTimestamp();
     if (out->NumElements() == 0) return;
 
     // When inner dim k == 0, inputs have NumElements == 0 but the output
@@ -212,9 +260,28 @@ class MusaMatMulOp : public MusaOpKernel {
     }
 
     if constexpr (std::is_same<T, double>::value) {
+      const double run_enter = DoubleMatMulTimestamp();
+      if (log_compute) {
+        std::fprintf(
+            stderr,
+            "MATMUL_COMPUTE_TIMING call=%d dtype=double m=%lld k=%lld n=%lld "
+            "enter=%.6f inputs_done=%.6f allocate_done=%.6f run_enter=%.6f "
+            "inputs_s=%.6f pre_alloc_s=%.6f pre_run_s=%.6f\n",
+            compute_id, static_cast<long long>(m), static_cast<long long>(k),
+            static_cast<long long>(n), compute_enter, inputs_done,
+            allocate_done, run_enter, inputs_done - compute_enter,
+            allocate_done - inputs_done, run_enter - allocate_done);
+      }
       OP_REQUIRES_OK(
           ctx, RunDoubleMatMul(ctx, in0, in1, m, k, n, trans_a_, trans_b_,
                                bcast, out));
+      if (log_compute) {
+        const double run_done = DoubleMatMulTimestamp();
+        std::fprintf(
+            stderr,
+            "MATMUL_COMPUTE_DONE call=%d dtype=double run_s=%.6f total_s=%.6f\n",
+            compute_id, run_done - run_enter, run_done - compute_enter);
+      }
       return;
     }
 
