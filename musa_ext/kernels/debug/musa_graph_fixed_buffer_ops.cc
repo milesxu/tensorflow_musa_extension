@@ -349,7 +349,6 @@ class MusaFixedGraphCaptureBeginOp : public OpKernel {
   int64_t generation_ = 0;
 };
 
-template <typename T>
 class MusaFixedGraphRetainTensorsOp : public OpKernel {
  public:
   explicit MusaFixedGraphRetainTensorsOp(OpKernelConstruction* ctx)
@@ -1023,8 +1022,9 @@ REGISTER_OP("MusaFixedGraphCaptureBegin")
 REGISTER_OP("MusaFixedGraphRetainTensors")
     .Input("a: T")
     .Input("b: T")
-    .Input("c: T")
+    .Input("c: U")
     .Attr("T: {float, double}")
+    .Attr("U: {float, double}")
     .Attr("handle: int = 1")
     .Attr("generation: int = 0")
     .Output("token: int32")
@@ -1142,13 +1142,27 @@ REGISTER_KERNEL_BUILDER(
 REGISTER_KERNEL_BUILDER(
     Name("MusaFixedGraphRetainTensors")
         .Device("MUSA")
-        .TypeConstraint<float>("T"),
-    MusaFixedGraphRetainTensorsOp<float>);
+        .TypeConstraint<float>("T")
+        .TypeConstraint<float>("U"),
+    MusaFixedGraphRetainTensorsOp);
 REGISTER_KERNEL_BUILDER(
     Name("MusaFixedGraphRetainTensors")
         .Device("MUSA")
-        .TypeConstraint<double>("T"),
-    MusaFixedGraphRetainTensorsOp<double>);
+        .TypeConstraint<float>("T")
+        .TypeConstraint<double>("U"),
+    MusaFixedGraphRetainTensorsOp);
+REGISTER_KERNEL_BUILDER(
+    Name("MusaFixedGraphRetainTensors")
+        .Device("MUSA")
+        .TypeConstraint<double>("T")
+        .TypeConstraint<float>("U"),
+    MusaFixedGraphRetainTensorsOp);
+REGISTER_KERNEL_BUILDER(
+    Name("MusaFixedGraphRetainTensors")
+        .Device("MUSA")
+        .TypeConstraint<double>("T")
+        .TypeConstraint<double>("U"),
+    MusaFixedGraphRetainTensorsOp);
 REGISTER_KERNEL_BUILDER(
     Name("MusaFixedGraphCaptureEnd").Device("MUSA"),
     MusaFixedGraphCaptureEndOp);

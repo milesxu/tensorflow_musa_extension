@@ -44,6 +44,7 @@ limitations under the License.
 // SP_Stream/SP_Event/ SP_Timer pointers are complete when dereferenced.
 struct SP_Event_st {
   musaEvent_t event;
+  musaStream_t stream;
 };
 
 struct SP_Timer_st {
@@ -554,7 +555,20 @@ SE_EventStatus plugin_se_get_event_status(const SP_Device* device,
   TF_DeleteStatus(st);
   musaError_t r = musaEventQuery(event->event);
   if (r == musaSuccess) return SE_EVENT_COMPLETE;
-  if (r == musaErrorNotReady) return SE_EVENT_PENDING;
+  if (event->stream != nullptr) {
+    musaStreamCaptureStatus capture_status = musaStreamCaptureStatusNone;
+    if (musaStreamIsCapturing(event->stream, &capture_status) == musaSuccess &&
+        capture_status == musaStreamCaptureStatusActive) {
+      const char* mode = std::getenv("MUSA_CAPTURE_EVENT_STATUS");
+      if (mode != nullptr && std::strcmp(mode, "complete") == 0) {
+        return SE_EVENT_COMPLETE;
+      }
+      return SE_EVENT_PENDING;
+    }
+  }
+  if (r == musaErrorNotReady || r == musaErrorNotPermitted) {
+    return SE_EVENT_PENDING;
+  }
   return SE_EVENT_ERROR;
 }
 
@@ -566,6 +580,7 @@ void plugin_se_record_event(const SP_Device* device, SP_Stream stream,
   }
   ::tensorflow::musa::runtime::SetMusaDeviceOrStatus(Ordinal(device), status);
   if (TF_GetCode(status) != TF_OK) return;
+  event->stream = stream->stream;
   musaError_t err = musaEventRecord(event->event, stream->stream);
   ::tensorflow::musa::runtime::SetStatusFromMusa(status, err,
                                                  "musaEventRecord");
