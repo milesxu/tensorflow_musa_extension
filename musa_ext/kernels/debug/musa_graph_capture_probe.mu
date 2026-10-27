@@ -107,6 +107,63 @@ extern "C" __global__ void MusaManualGraphPoisonFloatKernel(
   }
 }
 
+extern "C" __global__ void MusaManualGraphBackwardH2FloatKernel(
+    const float* wf, const float* idt, const float* h, float* output,
+    int elements, int width) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < elements) {
+    const int column = idx % width;
+    output[idx] = wf[column] * idt[column] * (1.0f - h[idx] * h[idx]);
+  }
+}
+
+extern "C" __global__ void MusaManualGraphAddVectorFloatKernel(
+    const float* matrix, const float* vector, float* output,
+    int elements, int width) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < elements) {
+    output[idx] = matrix[idx] + vector[idx % width];
+  }
+}
+
+extern "C" __global__ void MusaManualGraphAddMatrixFloatKernel(
+    const float* left, const float* right, float* output, int elements) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < elements) {
+    output[idx] = left[idx] + right[idx];
+  }
+}
+
+extern "C" __global__ void MusaManualGraphBackwardH1FloatKernel(
+    const float* gradient, const float* idt, const float* h, float* output,
+    int elements, int width) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < elements) {
+    const int column = idx % width;
+    output[idx] =
+        gradient[idx] * idt[column] * (1.0f - h[idx] * h[idx]);
+  }
+}
+
+extern "C" __global__ void MusaManualGraphBackwardH0FloatKernel(
+    const float* gradient, const float* h, float* output,
+    int elements) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < elements) {
+    output[idx] = gradient[idx] * (1.0f - h[idx] * h[idx]);
+  }
+}
+
+extern "C" __global__ void MusaManualGraphTransposeFloatKernel(
+    const float* input, float* output, int rows, int cols) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < rows * cols) {
+    const int row = idx / cols;
+    const int col = idx % cols;
+    output[col * rows + row] = input[idx];
+  }
+}
+
 extern "C" void* MusaManualGraphReshapeKernelAddress() {
   return reinterpret_cast<void*>(MusaManualGraphReshapeKernel);
 }
@@ -139,6 +196,30 @@ extern "C" void* MusaManualGraphPoisonFloatKernelAddress() {
   return reinterpret_cast<void*>(MusaManualGraphPoisonFloatKernel);
 }
 
+extern "C" void* MusaManualGraphBackwardH2FloatKernelAddress() {
+  return reinterpret_cast<void*>(MusaManualGraphBackwardH2FloatKernel);
+}
+
+extern "C" void* MusaManualGraphAddVectorFloatKernelAddress() {
+  return reinterpret_cast<void*>(MusaManualGraphAddVectorFloatKernel);
+}
+
+extern "C" void* MusaManualGraphAddMatrixFloatKernelAddress() {
+  return reinterpret_cast<void*>(MusaManualGraphAddMatrixFloatKernel);
+}
+
+extern "C" void* MusaManualGraphBackwardH1FloatKernelAddress() {
+  return reinterpret_cast<void*>(MusaManualGraphBackwardH1FloatKernel);
+}
+
+extern "C" void* MusaManualGraphBackwardH0FloatKernelAddress() {
+  return reinterpret_cast<void*>(MusaManualGraphBackwardH0FloatKernel);
+}
+
+extern "C" void* MusaManualGraphTransposeFloatKernelAddress() {
+  return reinterpret_cast<void*>(MusaManualGraphTransposeFloatKernel);
+}
+
 extern "C" void LaunchMusaManualGraphBiasTanhFloat(
     const float* input, const float* bias, float* pre, float* output,
     int elements, int width, musaStream_t stream) {
@@ -164,4 +245,53 @@ extern "C" void LaunchMusaManualGraphPoisonFloat(
     float* data, int elements, float value, musaStream_t stream) {
   MusaManualGraphPoisonFloatKernel<<<(elements + 255) / 256, 256, 0, stream>>>(
       data, elements, value);
+}
+
+extern "C" void LaunchMusaManualGraphBackwardH2Float(
+    const float* wf, const float* idt, const float* h, float* output,
+    int elements, int width, musaStream_t stream) {
+  MusaManualGraphBackwardH2FloatKernel<<<
+      (elements + 255) / 256, 256, 0, stream>>>(
+      wf, idt, h, output, elements, width);
+}
+
+extern "C" void LaunchMusaManualGraphAddVectorFloat(
+    const float* matrix, const float* vector, float* output,
+    int elements, int width, musaStream_t stream) {
+  MusaManualGraphAddVectorFloatKernel<<<
+      (elements + 255) / 256, 256, 0, stream>>>(
+      matrix, vector, output, elements, width);
+}
+
+extern "C" void LaunchMusaManualGraphAddMatrixFloat(
+    const float* left, const float* right, float* output,
+    int elements, musaStream_t stream) {
+  MusaManualGraphAddMatrixFloatKernel<<<
+      (elements + 255) / 256, 256, 0, stream>>>(
+      left, right, output, elements);
+}
+
+extern "C" void LaunchMusaManualGraphBackwardH1Float(
+    const float* gradient, const float* idt, const float* h, float* output,
+    int elements, int width, musaStream_t stream) {
+  MusaManualGraphBackwardH1FloatKernel<<<
+      (elements + 255) / 256, 256, 0, stream>>>(
+      gradient, idt, h, output, elements, width);
+}
+
+extern "C" void LaunchMusaManualGraphBackwardH0Float(
+    const float* gradient, const float* h, float* output,
+    int elements, musaStream_t stream) {
+  MusaManualGraphBackwardH0FloatKernel<<<
+      (elements + 255) / 256, 256, 0, stream>>>(
+      gradient, h, output, elements);
+}
+
+extern "C" void LaunchMusaManualGraphTransposeFloat(
+    const float* input, float* output, int rows, int cols,
+    musaStream_t stream) {
+  const int elements = rows * cols;
+  MusaManualGraphTransposeFloatKernel<<<
+      (elements + 255) / 256, 256, 0, stream>>>(
+      input, output, rows, cols);
 }

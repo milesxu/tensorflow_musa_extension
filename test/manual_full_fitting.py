@@ -56,6 +56,22 @@ def numpy_fitting_reference(arrays):
     return (add3 @ wf + bf).astype(np.float32)
 
 
+def numpy_fitting_gradient(arrays):
+    x, w0, b0, w1, b1, w2, b2, wf, _, idt1, idt2 = arrays
+    h0 = np.tanh(x @ w0 + b0).astype(np.float32)
+    h1 = np.tanh(h0 @ w1 + b1).astype(np.float32)
+    add2 = (h0 + h1 * idt1).astype(np.float32)
+    h2 = np.tanh(add2 @ w2 + b2).astype(np.float32)
+    wf_vector = wf[:, 0]
+    gt2 = (wf_vector * idt2 * (1.0 - h2 * h2)).astype(np.float32)
+    g2 = (gt2 @ w2.T + wf_vector).astype(np.float32)
+    gt1 = (g2 * idt1 * (1.0 - h1 * h1)).astype(np.float32)
+    g1 = (gt1 @ w1.T + g2).astype(np.float32)
+    gt0 = (g1 * (1.0 - h0 * h0)).astype(np.float32)
+    grad_x = (gt0 @ w0.T).astype(np.float32)
+    return grad_x.reshape(1, NLOC, 1600)
+
+
 def diff_stats(label, actual, expected):
     diff = np.abs(actual - expected)
     rms = float(np.sqrt(np.mean(np.square(actual - expected))))
@@ -93,6 +109,7 @@ def run_reference(
     fitting_tensors,
     identity_pairs,
     reference,
+    grad_reference,
     seed,
 ):
     box, coord, atom_type, natoms, mesh = graph_tensors
@@ -102,7 +119,7 @@ def run_reference(
     values = sess.run(
         fitting_tensors
         + [tensor for pair in identity_pairs for tensor in pair]
-        + [reference],
+        + [reference, grad_reference],
         feed_dict={
             box: box_value,
             coord: coord_value,
@@ -112,8 +129,9 @@ def run_reference(
         },
     )
     arrays = values[: len(fitting_tensors)]
-    identity_values = values[len(fitting_tensors) : -1]
-    expected = values[-1]
+    identity_values = values[len(fitting_tensors) : len(fitting_tensors) + 6]
+    expected = values[len(fitting_tensors) + 6]
+    grad_expected = values[len(fitting_tensors) + 7]
     for index in range(3):
         tanh_value = identity_values[index * 2]
         reshape_value = identity_values[index * 2 + 1]
@@ -126,12 +144,17 @@ def run_reference(
     ):
         raise RuntimeError("residual idt is not finite")
     cpu_expected = numpy_fitting_reference(arrays)
+    cpu_grad = numpy_fitting_gradient(arrays)
     if not np.all(np.isfinite(cpu_expected)):
         raise RuntimeError("NumPy reference output is not finite")
+    if not np.all(np.isfinite(cpu_grad)):
+        raise RuntimeError("NumPy gradient reference is not finite")
     return {
         "arrays": arrays,
         "expected": expected,
         "cpu_expected": cpu_expected,
+        "grad_expected": grad_expected,
+        "cpu_grad": cpu_grad,
         "seed": seed,
     }
 
@@ -158,6 +181,39 @@ def check_result(label, result, expected, cpu_expected):
         or manual_vs_musa["nrmse"] > 2e-4
     ):
         raise RuntimeError(f"{label} manual fitting differs from MUSA")
+
+
+def check_gradient(label, result, expected, cpu_expected):
+    if result.shape != expected.shape:
+        raise RuntimeError(f"{label} gradient shape mismatch")
+    if not np.all(np.isfinite(result)):
+        raise RuntimeError(f"{label} gradient is not finite")
+    manual_vs_musa = diff_stats(
+        f"{label}_manual_vs_musa", result, expected
+    )
+    diff_stats(f"{label}_musa_vs_cpu", expected, cpu_expected)
+    manual_vs_cpu = diff_stats(
+        f"{label}_manual_vs_cpu", result, cpu_expected
+    )
+    if (
+        manual_vs_cpu["max_abs_diff"] > 2e-5
+        or manual_vs_cpu["nrmse"] > 1e-6
+    ):
+        raise RuntimeError(f"{label} gradient differs from NumPy CPU")
+    if (
+        manual_vs_musa["max_abs_diff"] > 1e-2
+        or manual_vs_musa["nrmse"] > 2e-4
+    ):
+        raise RuntimeError(f"{label} gradient differs from MUSA reference")
+    print(
+        f"{label}_gate",
+        "cpu:max_abs<=2e-5,nrmse<=1e-6 "
+        "musa:max_abs<=1e-2,nrmse<=2e-4",
+    )
+    return {
+        "manual_vs_musa": manual_vs_musa,
+        "manual_vs_cpu": manual_vs_cpu,
+    }
 
 
 def main():
@@ -205,6 +261,9 @@ def main():
             reference = graph.get_tensor_by_name(
                 "final_layer_type_0/BiasAdd:0"
             )
+            grad_reference = graph.get_tensor_by_name(
+                "gradients/Reshape_18_grad/Reshape:0"
+            )
 
     graph_tensors = [box, coord, atom_type, natoms, mesh]
     with tf.compat.v1.Session(graph=graph) as sess:
@@ -214,6 +273,7 @@ def main():
             tensors,
             identity_pairs,
             reference,
+            grad_reference,
             20261027,
         )
         reference_b = run_reference(
@@ -222,6 +282,7 @@ def main():
             tensors,
             identity_pairs,
             reference,
+            grad_reference,
             20261028,
         )
     arrays_a = reference_a["arrays"]
@@ -230,6 +291,10 @@ def main():
     expected_b = reference_b["expected"]
     cpu_expected_a = reference_a["cpu_expected"]
     cpu_expected_b = reference_b["cpu_expected"]
+    grad_expected_a = reference_a["grad_expected"]
+    grad_expected_b = reference_b["grad_expected"]
+    cpu_grad_a = reference_a["cpu_grad"]
+    cpu_grad_b = reference_b["cpu_grad"]
     if np.array_equal(arrays_a[0], arrays_b[0]):
         raise RuntimeError("second fixture did not change fitting input")
     for index in range(1, len(arrays_a)):
@@ -238,6 +303,7 @@ def main():
     print("input_shapes", [array.shape for array in arrays_a])
     print("reference_seeds", reference_a["seed"], reference_b["seed"])
     print("reference_shape", expected_a.shape, expected_a.dtype)
+    print("gradient_reference_shape", grad_expected_a.shape, grad_expected_a.dtype)
     print("tanh_reshape_identity", True)
     print("idt_shapes", arrays_a[9].shape, arrays_a[10].shape)
     print("fixture_x_changed", True)
@@ -272,36 +338,49 @@ def main():
             actual = ops.musa_manual_graph_full_fitting(*placeholders)
     with tf.compat.v1.Session(graph=cap_graph) as sess:
         start_a1 = time.perf_counter()
-        result_a1 = sess.run(
+        result_a1, grad_a1 = sess.run(
             actual, feed_dict=dict(zip(placeholders, arrays_a))
         )
         start_b = time.perf_counter()
-        result_b = sess.run(
+        result_b, grad_b = sess.run(
             actual, feed_dict=dict(zip(placeholders, arrays_b))
         )
         start_a2 = time.perf_counter()
-        result_a2 = sess.run(
+        result_a2, grad_a2 = sess.run(
             actual, feed_dict=dict(zip(placeholders, arrays_a))
         )
-        end_a2 = time.perf_counter()
-    if not np.array_equal(result_a1, result_a2):
+        start_a3 = time.perf_counter()
+        result_a3, grad_a3 = sess.run(
+            actual, feed_dict=dict(zip(placeholders, arrays_a))
+        )
+        end_a3 = time.perf_counter()
+    if not np.array_equal(result_a2, result_a3):
         raise RuntimeError("cached exec repeat A output changed")
-    if np.array_equal(result_a1, result_b):
+    if not np.array_equal(grad_a2, grad_a3):
+        raise RuntimeError("cached exec repeat A gradient changed")
+    if np.array_equal(result_a2, result_b):
         raise RuntimeError("cached exec did not react to changed input")
+    if np.array_equal(grad_a2, grad_b):
+        raise RuntimeError("cached exec gradient did not react to input")
 
     print("result_shape", result_a1.shape)
-    print("cache_calls", 3)
-    print("cache_repeat_a_bitwise", True)
+    print("gradient_shape", grad_a1.shape)
+    print("cache_calls", 4)
+    print("cache_hit_repeat_a_bitwise", True)
     print("cache_input_sensitivity", True)
+    print("gradient_hit_repeat_a_bitwise", True)
+    print("gradient_input_sensitivity", True)
     cache_miss_ms = (start_b - start_a1) * 1e3
     cache_hit_b_ms = (start_a2 - start_b) * 1e3
-    cache_hit_a_ms = (end_a2 - start_a2) * 1e3
+    cache_hit_a2_ms = (start_a3 - start_a2) * 1e3
+    cache_hit_a3_ms = (end_a3 - start_a3) * 1e3
     print("cache_miss_ms", cache_miss_ms)
     print("cache_hit_b_ms", cache_hit_b_ms)
-    print("cache_hit_a_ms", cache_hit_a_ms)
+    print("cache_hit_a2_ms", cache_hit_a2_ms)
+    print("cache_hit_a3_ms", cache_hit_a3_ms)
     print(
         "cache_hit_avg_ms",
-        (cache_hit_b_ms + cache_hit_a_ms) / 2.0,
+        (cache_hit_b_ms + cache_hit_a2_ms + cache_hit_a3_ms) / 3.0,
     )
     print(
         "result_a_stats",
@@ -312,11 +391,33 @@ def main():
             "rms": float(np.sqrt(np.mean(np.square(result_a1)))),
         },
     )
+    print(
+        "gradient_a_stats",
+        {
+            "min": float(np.min(grad_a1)),
+            "max": float(np.max(grad_a1)),
+            "mean": float(np.mean(grad_a1)),
+            "rms": float(np.sqrt(np.mean(np.square(grad_a1)))),
+        },
+    )
     check_result("a", result_a1, expected_a, cpu_expected_a)
+    check_result("hit_a", result_a2, expected_a, cpu_expected_a)
     check_result("b", result_b, expected_b, cpu_expected_b)
+    grad_metrics_a = check_gradient(
+        "gradient_a", grad_a1, grad_expected_a, cpu_grad_a
+    )
+    grad_metrics_b = check_gradient(
+        "gradient_b", grad_b, grad_expected_b, cpu_grad_b
+    )
+    grad_metrics_hit_a = check_gradient(
+        "gradient_hit_a", grad_a2, grad_expected_a, cpu_grad_a
+    )
     print("manual_vs_cpu_gate", "max_abs<=2e-5 nrmse<=1e-6")
     print("manual_vs_musa_gate", "max_abs<=5e-3 nrmse<=2e-4")
-    print("MANUAL_FULL_FITTING_CACHE_PASS")
+    print("gradient_metrics_a", grad_metrics_a)
+    print("gradient_metrics_b", grad_metrics_b)
+    print("gradient_metrics_hit_a", grad_metrics_hit_a)
+    print("MANUAL_FULL_FITTING_BACKWARD_PASS")
 
 
 if __name__ == "__main__":
