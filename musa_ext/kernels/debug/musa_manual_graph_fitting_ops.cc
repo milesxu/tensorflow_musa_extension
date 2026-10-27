@@ -107,16 +107,20 @@ class MusaManualGraphFittingOp : public OpKernel {
     };
 
     const double a1[16] = {
-        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
+        0.1, -0.2, 0.3, -0.4, 0.5, -0.6, 0.7, -0.8,
+        0.9, -1.0, 0.2, -0.3, 0.4, -0.5, 0.6, -0.7,
     };
     const double b1[16] = {
-        2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17,
+        0.2, 0.3, -0.4, 0.5, -0.6, 0.7, -0.8, 0.9,
+        -0.1, 0.2, 0.3, -0.4, 0.5, -0.6, 0.7, -0.8,
     };
     const double a2[16] = {
-        2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53,
+        -0.3, 0.4, -0.5, 0.6, 0.7, -0.8, 0.9, -0.1,
+        0.2, -0.4, 0.5, -0.6, 0.8, -0.9, 0.1, -0.2,
     };
     const double b2[16] = {
-        3, 1, 4, 1, 5, 9, 2, 6, 5, 3, 5, 8, 9, 7, 9, 3,
+        0.4, -0.5, 0.6, -0.7, 0.8, -0.9, 0.1, -0.2,
+        0.3, -0.4, 0.5, -0.6, 0.7, -0.8, 0.9, -0.1,
     };
 
     Status status = allocate(&a_dev, sizeof(a1), "musaMalloc(a)");
@@ -278,6 +282,32 @@ class MusaManualGraphFittingOp : public OpKernel {
         "musaGraphAddKernelNode(tick)");
     if (!status.ok()) return fail(status);
 
+    size_t final_node_count = 0;
+    status = CheckMusa(musaGraphGetNodes(graph, nullptr, &final_node_count),
+                       "musaGraphGetNodes(final)");
+    if (!status.ok()) return fail(status);
+    std::vector<musaGraphNode_t> final_nodes(final_node_count);
+    size_t final_fetched = final_node_count;
+    status = CheckMusa(
+        musaGraphGetNodes(graph, final_nodes.data(), &final_fetched),
+        "musaGraphGetNodes(final,data)");
+    if (!status.ok()) return fail(status);
+    size_t final_kernel_count = 0;
+    for (musaGraphNode_t node : final_nodes) {
+      musaGraphNodeType type;
+      status = CheckMusa(musaGraphNodeGetType(node, &type),
+                         "musaGraphNodeGetType(final)");
+      if (!status.ok()) return fail(status);
+      if (type == musaGraphNodeTypeKernel) {
+        ++final_kernel_count;
+      }
+    }
+    if (final_node_count != 5 || final_kernel_count != 5) {
+      return fail(errors::Internal(
+          "unexpected fitting graph node count: nodes=", final_node_count,
+          " kernels=", final_kernel_count));
+    }
+
     status = CheckMusa(musaGraphInstantiate(&exec, graph, 0),
                        "musaGraphInstantiate(fitting)");
     if (!status.ok()) return fail(status);
@@ -286,6 +316,16 @@ class MusaManualGraphFittingOp : public OpKernel {
     status = CheckMusa(musaStreamSynchronize(stream),
                        "musaStreamSynchronize(replay1)");
     if (!status.ok()) return fail(status);
+    unsigned int tick_after_first = 0;
+    status = CheckMusa(musaMemcpy(&tick_after_first, counter,
+                                  sizeof(tick_after_first),
+                                  musaMemcpyDeviceToHost),
+                       "musaMemcpy(counter_after_first)");
+    if (!status.ok()) return fail(status);
+    if (tick_after_first != 1) {
+      return fail(errors::Internal("first fitting replay count mismatch: ",
+                                   tick_after_first));
+    }
     status = CheckMusa(
         musaMemcpyAsync(output->flat<double>().data(), tanh_dev,
                         sizeof(double) * 16, musaMemcpyDeviceToDevice, stream),
@@ -334,8 +374,9 @@ class MusaManualGraphFittingOp : public OpKernel {
                                    tick_count));
     }
     std::fprintf(stderr,
-                 "MANUAL_FITTING_PROBE gemm_nodes=1 added_nodes=4 "
-                 "tick=2 tanh=16 sum=1\n");
+                 "MANUAL_FITTING_PROBE nodes=%zu kernels=%zu gemm_nodes=1 "
+                 "added_nodes=4 tick=2 tanh=16 sum=1\n",
+                 final_node_count, final_kernel_count);
     cleanup();
   }
 };
