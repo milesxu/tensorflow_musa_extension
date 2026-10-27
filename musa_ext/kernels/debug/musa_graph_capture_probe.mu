@@ -33,3 +33,42 @@ extern "C" void LaunchMusaGraphCounterTick(unsigned int* counter,
 extern "C" void* MusaGraphCounterTickKernelAddress() {
   return reinterpret_cast<void*>(MusaGraphCounterTickKernel);
 }
+
+extern "C" __global__ void MusaManualGraphReshapeKernel(
+    const double* input, double* output) {
+  const int idx = threadIdx.x;
+  if (idx < 16) {
+    output[idx] = input[idx];
+  }
+}
+
+extern "C" __global__ void MusaManualGraphTanhKernel(
+    const double* input, double* output) {
+  const int idx = threadIdx.x;
+  if (idx < 16) {
+    output[idx] = tanh(input[idx]);
+  }
+}
+
+extern "C" __global__ void MusaManualGraphSumKernel(
+    const double* input, double* output) {
+  if (blockIdx.x == 0 && threadIdx.x == 0) {
+    double sum = 0.0;
+    for (int idx = 0; idx < 16; ++idx) {
+      sum += input[idx];
+    }
+    output[0] = sum;
+  }
+}
+
+extern "C" void* MusaManualGraphReshapeKernelAddress() {
+  return reinterpret_cast<void*>(MusaManualGraphReshapeKernel);
+}
+
+extern "C" void* MusaManualGraphTanhKernelAddress() {
+  return reinterpret_cast<void*>(MusaManualGraphTanhKernel);
+}
+
+extern "C" void* MusaManualGraphSumKernelAddress() {
+  return reinterpret_cast<void*>(MusaManualGraphSumKernel);
+}
