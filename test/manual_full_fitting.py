@@ -94,6 +94,13 @@ def main():
                 "layer_2_type_0/idt:0",
             ]
             tensors = [graph.get_tensor_by_name(name) for name in names]
+            identity_pairs = [
+                (
+                    graph.get_tensor_by_name(f"layer_{layer}_type_0/Tanh:0"),
+                    graph.get_tensor_by_name(f"layer_{layer}_type_0/Reshape:0"),
+                )
+                for layer in range(3)
+            ]
             reference = graph.get_tensor_by_name(
                 "final_layer_type_0/BiasAdd:0"
             )
@@ -101,7 +108,9 @@ def main():
     box_value, coord_value, type_value, natoms_value, mesh_value = make_inputs()
     with tf.compat.v1.Session(graph=graph) as sess:
         values = sess.run(
-            tensors + [reference],
+            tensors
+            + [tensor for pair in identity_pairs for tensor in pair]
+            + [reference],
             feed_dict={
                 box: box_value,
                 coord: coord_value,
@@ -110,11 +119,25 @@ def main():
                 mesh: mesh_value,
             },
         )
-    arrays = values[:-1]
+    arrays = values[: len(tensors)]
+    identity_values = values[len(tensors) : -1]
     expected = values[-1]
+    for index in range(3):
+        tanh_value = identity_values[index * 2]
+        reshape_value = identity_values[index * 2 + 1]
+        if not np.array_equal(tanh_value, reshape_value):
+            raise RuntimeError(f"layer {index} Tanh/Reshape is not identity")
+    if arrays[9].shape != (240,) or arrays[10].shape != (240,):
+        raise RuntimeError("residual idt shape mismatch")
+    if not np.all(np.isfinite(arrays[9])) or not np.all(
+        np.isfinite(arrays[10])
+    ):
+        raise RuntimeError("residual idt is not finite")
     cpu_expected = numpy_fitting_reference(arrays)
     print("input_shapes", [array.shape for array in arrays])
     print("reference_shape", expected.shape, expected.dtype)
+    print("tanh_reshape_identity", True)
+    print("idt_shapes", arrays[9].shape, arrays[10].shape)
     print(
         "reference_stats",
         {
