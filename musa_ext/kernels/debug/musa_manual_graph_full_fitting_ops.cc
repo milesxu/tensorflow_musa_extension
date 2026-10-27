@@ -1,0 +1,460 @@
+#include "../utils_op.h"
+
+#include "tensorflow/core/framework/op.h"
+#include "tensorflow/core/framework/op_kernel.h"
+#include "tensorflow/core/framework/shape_inference.h"
+
+#include <mublas.h>
+#include <musa_runtime.h>
+
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <vector>
+
+extern "C" void LaunchMusaGraphCounterTick(unsigned int* counter,
+                                           musaStream_t stream);
+extern "C" void LaunchMusaManualGraphBiasTanhFloat(
+    const float* input, const float* bias, float* pre, float* output,
+    int elements, int width, musaStream_t stream);
+extern "C" void LaunchMusaManualGraphBiasFloat(
+    const float* input, const float* bias, float* output, int elements,
+    int width, musaStream_t stream);
+extern "C" void LaunchMusaManualGraphResidualFloat(
+    const float* previous, const float* current, const float* idt,
+    float* output, int elements, int width, musaStream_t stream);
+
+namespace tensorflow {
+namespace musa {
+namespace {
+
+constexpr int kM = 1536;
+constexpr int kK = 1600;
+constexpr int kH = 240;
+constexpr int kActive = kM * kH;
+
+Status CheckMusa(musaError_t status, const char* call) {
+  if (status == musaSuccess) return OkStatus();
+  return errors::Internal(call, " failed with MUSA error ",
+                          static_cast<int>(status));
+}
+
+Status CheckMublas(mublasStatus_t status, const char* call) {
+  if (status == MUBLAS_STATUS_SUCCESS) return OkStatus();
+  return errors::Internal(call, " failed with muBLAS status ",
+                          static_cast<int>(status));
+}
+
+class MusaManualGraphFullFittingOp : public OpKernel {
+ public:
+  explicit MusaManualGraphFullFittingOp(OpKernelConstruction* ctx)
+      : OpKernel(ctx) {}
+
+  void Compute(OpKernelContext* ctx) override {
+    const Tensor& x = ctx->input(0);
+    const Tensor& w0 = ctx->input(1);
+    const Tensor& b0 = ctx->input(2);
+    const Tensor& w1 = ctx->input(3);
+    const Tensor& b1 = ctx->input(4);
+    const Tensor& w2 = ctx->input(5);
+    const Tensor& b2 = ctx->input(6);
+    const Tensor& wf = ctx->input(7);
+    const Tensor& bf = ctx->input(8);
+    const Tensor& idt1 = ctx->input(9);
+    const Tensor& idt2 = ctx->input(10);
+    OP_REQUIRES(
+        ctx,
+        x.dtype() == DT_FLOAT && w0.dtype() == DT_FLOAT &&
+            b0.dtype() == DT_FLOAT && w1.dtype() == DT_FLOAT &&
+            b1.dtype() == DT_FLOAT && w2.dtype() == DT_FLOAT &&
+            b2.dtype() == DT_FLOAT && wf.dtype() == DT_FLOAT &&
+            bf.dtype() == DT_FLOAT && idt1.dtype() == DT_FLOAT &&
+            idt2.dtype() == DT_FLOAT,
+        errors::InvalidArgument("full fitting inputs must be float"));
+    OP_REQUIRES(ctx, x.shape() == TensorShape({kM, kK}),
+                errors::InvalidArgument("x shape mismatch"));
+    OP_REQUIRES(ctx, w0.shape() == TensorShape({kK, kH}) &&
+                         b0.shape() == TensorShape({kH}),
+                errors::InvalidArgument("layer0 shape mismatch"));
+    OP_REQUIRES(ctx, w1.shape() == TensorShape({kH, kH}) &&
+                         b1.shape() == TensorShape({kH}),
+                errors::InvalidArgument("layer1 shape mismatch"));
+    OP_REQUIRES(ctx, w2.shape() == TensorShape({kH, kH}) &&
+                         b2.shape() == TensorShape({kH}),
+                errors::InvalidArgument("layer2 shape mismatch"));
+    OP_REQUIRES(ctx, wf.shape() == TensorShape({kH, 1}) &&
+                         bf.shape() == TensorShape({1}),
+                errors::InvalidArgument("final layer shape mismatch"));
+    OP_REQUIRES(ctx, idt1.shape() == TensorShape({kH}) &&
+                         idt2.shape() == TensorShape({kH}),
+                errors::InvalidArgument("residual idt shape mismatch"));
+
+    Tensor* output = nullptr;
+    OP_REQUIRES_OK(ctx, ctx->allocate_output(0, TensorShape({kM, 1}), &output));
+    musaStream_t stream = GetMusaStreamByCtx(ctx);
+    mublasHandle_t handle = nullptr;
+    musaGraph_t graph = nullptr;
+    musaGraphExec_t exec = nullptr;
+
+    auto alloc = [&](float** ptr, size_t bytes, const char* name) {
+      return CheckMusa(musaMalloc(reinterpret_cast<void**>(ptr), bytes), name);
+    };
+    float* x_dev = nullptr;
+    float* w0_dev = nullptr;
+    float* b0_dev = nullptr;
+    float* w1_dev = nullptr;
+    float* b1_dev = nullptr;
+    float* w2_dev = nullptr;
+    float* b2_dev = nullptr;
+    float* wf_dev = nullptr;
+    float* bf_dev = nullptr;
+    float* idt1_dev = nullptr;
+    float* idt2_dev = nullptr;
+    float* h0g_dev = nullptr;
+    float* h0_dev = nullptr;
+    float* h1g_dev = nullptr;
+    float* h1_dev = nullptr;
+    float* h2g_dev = nullptr;
+    float* h2_dev = nullptr;
+    float* add2_dev = nullptr;
+    float* add3_dev = nullptr;
+    float* fg_dev = nullptr;
+    float* replay1_dev = nullptr;
+    float* final_dev = nullptr;
+    unsigned int* counter = nullptr;
+
+    auto cleanup = [&]() {
+      if (stream != nullptr) {
+        musaStreamCaptureStatus capture_status = musaStreamCaptureStatusNone;
+        if (musaStreamIsCapturing(stream, &capture_status) == musaSuccess &&
+            capture_status == musaStreamCaptureStatusActive) {
+          musaGraph_t aborted = nullptr;
+          musaStreamEndCapture(stream, &aborted);
+          if (aborted != nullptr) musaGraphDestroy(aborted);
+        }
+        musaStreamSynchronize(stream);
+      }
+      if (exec != nullptr) {
+        musaGraphExecDestroy(exec);
+        exec = nullptr;
+      }
+      if (graph != nullptr) {
+        musaGraphDestroy(graph);
+        graph = nullptr;
+      }
+      if (handle != nullptr) {
+        mublasDestroy(handle);
+        handle = nullptr;
+      }
+      auto free_buffer = [](void** ptr) {
+        if (*ptr != nullptr) {
+          musaFree(*ptr);
+          *ptr = nullptr;
+        }
+      };
+      free_buffer(reinterpret_cast<void**>(&x_dev));
+      free_buffer(reinterpret_cast<void**>(&w0_dev));
+      free_buffer(reinterpret_cast<void**>(&b0_dev));
+      free_buffer(reinterpret_cast<void**>(&w1_dev));
+      free_buffer(reinterpret_cast<void**>(&b1_dev));
+      free_buffer(reinterpret_cast<void**>(&w2_dev));
+      free_buffer(reinterpret_cast<void**>(&b2_dev));
+      free_buffer(reinterpret_cast<void**>(&wf_dev));
+      free_buffer(reinterpret_cast<void**>(&bf_dev));
+      free_buffer(reinterpret_cast<void**>(&idt1_dev));
+      free_buffer(reinterpret_cast<void**>(&idt2_dev));
+      free_buffer(reinterpret_cast<void**>(&h0g_dev));
+      free_buffer(reinterpret_cast<void**>(&h0_dev));
+      free_buffer(reinterpret_cast<void**>(&h1g_dev));
+      free_buffer(reinterpret_cast<void**>(&h1_dev));
+      free_buffer(reinterpret_cast<void**>(&h2g_dev));
+      free_buffer(reinterpret_cast<void**>(&h2_dev));
+      free_buffer(reinterpret_cast<void**>(&add2_dev));
+      free_buffer(reinterpret_cast<void**>(&add3_dev));
+      free_buffer(reinterpret_cast<void**>(&fg_dev));
+      free_buffer(reinterpret_cast<void**>(&replay1_dev));
+      free_buffer(reinterpret_cast<void**>(&final_dev));
+      free_buffer(reinterpret_cast<void**>(&counter));
+    };
+    auto fail = [&](const Status& status) {
+      cleanup();
+      ctx->CtxFailure(status);
+    };
+
+    Status status = alloc(&x_dev, sizeof(float) * kM * kK, "musaMalloc(x)");
+    if (!status.ok()) return fail(status);
+    status = alloc(&w0_dev, sizeof(float) * kK * kH, "musaMalloc(w0)");
+    if (!status.ok()) return fail(status);
+    status = alloc(&b0_dev, sizeof(float) * kH, "musaMalloc(b0)");
+    if (!status.ok()) return fail(status);
+    status = alloc(&w1_dev, sizeof(float) * kH * kH, "musaMalloc(w1)");
+    if (!status.ok()) return fail(status);
+    status = alloc(&b1_dev, sizeof(float) * kH, "musaMalloc(b1)");
+    if (!status.ok()) return fail(status);
+    status = alloc(&w2_dev, sizeof(float) * kH * kH, "musaMalloc(w2)");
+    if (!status.ok()) return fail(status);
+    status = alloc(&b2_dev, sizeof(float) * kH, "musaMalloc(b2)");
+    if (!status.ok()) return fail(status);
+    status = alloc(&wf_dev, sizeof(float) * kH, "musaMalloc(wf)");
+    if (!status.ok()) return fail(status);
+    status = alloc(&bf_dev, sizeof(float), "musaMalloc(bf)");
+    if (!status.ok()) return fail(status);
+    status = alloc(&idt1_dev, sizeof(float) * kH, "musaMalloc(idt1)");
+    if (!status.ok()) return fail(status);
+    status = alloc(&idt2_dev, sizeof(float) * kH, "musaMalloc(idt2)");
+    if (!status.ok()) return fail(status);
+    status = alloc(&h0g_dev, sizeof(float) * kActive, "musaMalloc(h0g)");
+    if (!status.ok()) return fail(status);
+    status = alloc(&h0_dev, sizeof(float) * kActive, "musaMalloc(h0)");
+    if (!status.ok()) return fail(status);
+    status = alloc(&h1g_dev, sizeof(float) * kActive, "musaMalloc(h1g)");
+    if (!status.ok()) return fail(status);
+    status = alloc(&h1_dev, sizeof(float) * kActive, "musaMalloc(h1)");
+    if (!status.ok()) return fail(status);
+    status = alloc(&h2g_dev, sizeof(float) * kActive, "musaMalloc(h2g)");
+    if (!status.ok()) return fail(status);
+    status = alloc(&h2_dev, sizeof(float) * kActive, "musaMalloc(h2)");
+    if (!status.ok()) return fail(status);
+    status = alloc(&add2_dev, sizeof(float) * kActive, "musaMalloc(add2)");
+    if (!status.ok()) return fail(status);
+    status = alloc(&add3_dev, sizeof(float) * kActive, "musaMalloc(add3)");
+    if (!status.ok()) return fail(status);
+    status = alloc(&fg_dev, sizeof(float) * kM, "musaMalloc(fg)");
+    if (!status.ok()) return fail(status);
+    status =
+        alloc(&replay1_dev, sizeof(float) * kM, "musaMalloc(replay1)");
+    if (!status.ok()) return fail(status);
+    status = alloc(&final_dev, sizeof(float) * kM, "musaMalloc(final)");
+    if (!status.ok()) return fail(status);
+    status = CheckMusa(musaMalloc(reinterpret_cast<void**>(&counter),
+                                  sizeof(*counter)),
+                       "musaMalloc(counter)");
+    if (!status.ok()) return fail(status);
+    status = CheckMusa(musaMemset(counter, 0, sizeof(*counter)),
+                       "musaMemset(counter)");
+    if (!status.ok()) return fail(status);
+
+    status = CheckMublas(mublasCreate(&handle), "mublasCreate");
+    if (!status.ok()) return fail(status);
+    status = CheckMublas(mublasSetStream(handle, stream), "mublasSetStream");
+    if (!status.ok()) return fail(status);
+
+    auto copy_input = [&](float* dst, const Tensor& src, const char* name) {
+      return CheckMusa(
+          musaMemcpyAsync(dst, src.flat<float>().data(), src.TotalBytes(),
+                          musaMemcpyDeviceToDevice, stream),
+          name);
+    };
+    status = copy_input(x_dev, x, "copy(x)");
+    if (!status.ok()) return fail(status);
+    status = copy_input(w0_dev, w0, "copy(w0)");
+    if (!status.ok()) return fail(status);
+    status = copy_input(b0_dev, b0, "copy(b0)");
+    if (!status.ok()) return fail(status);
+    status = copy_input(w1_dev, w1, "copy(w1)");
+    if (!status.ok()) return fail(status);
+    status = copy_input(b1_dev, b1, "copy(b1)");
+    if (!status.ok()) return fail(status);
+    status = copy_input(w2_dev, w2, "copy(w2)");
+    if (!status.ok()) return fail(status);
+    status = copy_input(b2_dev, b2, "copy(b2)");
+    if (!status.ok()) return fail(status);
+    status = copy_input(wf_dev, wf, "copy(wf)");
+    if (!status.ok()) return fail(status);
+    status = copy_input(bf_dev, bf, "copy(bf)");
+    if (!status.ok()) return fail(status);
+    status = copy_input(idt1_dev, idt1, "copy(idt1)");
+    if (!status.ok()) return fail(status);
+    status = copy_input(idt2_dev, idt2, "copy(idt2)");
+    if (!status.ok()) return fail(status);
+    status = CheckMusa(musaStreamSynchronize(stream), "sync(inputs)");
+    if (!status.ok()) return fail(status);
+
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    auto run_sequence = [&]() -> Status {
+      Status s = CheckMublas(
+          mublasSgemm(handle, MUBLAS_OP_N, MUBLAS_OP_N, kH, kM, kK, &alpha,
+                      w0_dev, kH, x_dev, kK, &beta, h0g_dev, kH),
+          "mublasSgemm(layer0)");
+      if (!s.ok()) return s;
+      LaunchMusaManualGraphBiasTanhFloat(h0g_dev, b0_dev, h0g_dev, h0_dev,
+                                         kActive, kH, stream);
+      s = CheckMusa(musaGetLastError(), "launch(bias_tanh0)");
+      if (!s.ok()) return s;
+
+      s = CheckMublas(
+          mublasSgemm(handle, MUBLAS_OP_N, MUBLAS_OP_N, kH, kM, kH, &alpha,
+                      w1_dev, kH, h0_dev, kH, &beta, h1g_dev, kH),
+          "mublasSgemm(layer1)");
+      if (!s.ok()) return s;
+      LaunchMusaManualGraphBiasTanhFloat(h1g_dev, b1_dev, h1g_dev, h1_dev,
+                                         kActive, kH, stream);
+      s = CheckMusa(musaGetLastError(), "launch(bias_tanh1)");
+      if (!s.ok()) return s;
+      LaunchMusaManualGraphResidualFloat(h0_dev, h1_dev, idt1_dev, add2_dev,
+                                         kActive, kH, stream);
+      s = CheckMusa(musaGetLastError(), "launch(residual1)");
+      if (!s.ok()) return s;
+
+      s = CheckMublas(
+          mublasSgemm(handle, MUBLAS_OP_N, MUBLAS_OP_N, kH, kM, kH, &alpha,
+                      w2_dev, kH, add2_dev, kH, &beta, h2g_dev, kH),
+          "mublasSgemm(layer2)");
+      if (!s.ok()) return s;
+      LaunchMusaManualGraphBiasTanhFloat(h2g_dev, b2_dev, h2g_dev, h2_dev,
+                                         kActive, kH, stream);
+      s = CheckMusa(musaGetLastError(), "launch(bias_tanh2)");
+      if (!s.ok()) return s;
+      LaunchMusaManualGraphResidualFloat(add2_dev, h2_dev, idt2_dev, add3_dev,
+                                         kActive, kH, stream);
+      s = CheckMusa(musaGetLastError(), "launch(residual2)");
+      if (!s.ok()) return s;
+
+      s = CheckMublas(
+          mublasSgemm(handle, MUBLAS_OP_N, MUBLAS_OP_N, 1, kM, kH, &alpha,
+                      wf_dev, 1, add3_dev, kH, &beta, fg_dev, 1),
+          "mublasSgemm(final)");
+      if (!s.ok()) return s;
+      LaunchMusaManualGraphBiasFloat(fg_dev, bf_dev, final_dev, kM, 1, stream);
+      s = CheckMusa(musaGetLastError(), "launch(bias_final)");
+      if (!s.ok()) return s;
+      LaunchMusaGraphCounterTick(counter, stream);
+      return CheckMusa(musaGetLastError(), "launch(tick)");
+    };
+
+    status = run_sequence();
+    if (!status.ok()) return fail(status);
+    status = CheckMusa(musaStreamSynchronize(stream), "sync(warmup)");
+    if (!status.ok()) return fail(status);
+    status = CheckMusa(musaMemset(counter, 0, sizeof(*counter)),
+                       "musaMemset(counter_after_warmup)");
+    if (!status.ok()) return fail(status);
+    status = CheckMusa(musaStreamSynchronize(stream), "sync(counter_reset)");
+    if (!status.ok()) return fail(status);
+    status = CheckMusa(
+        musaStreamBeginCapture(stream, musaStreamCaptureModeRelaxed),
+        "musaStreamBeginCapture(full_fitting)");
+    if (!status.ok()) return fail(status);
+    status = run_sequence();
+    if (!status.ok()) {
+      musaGraph_t aborted = nullptr;
+      musaStreamEndCapture(stream, &aborted);
+      if (aborted != nullptr) musaGraphDestroy(aborted);
+      return fail(status);
+    }
+    status = CheckMusa(musaStreamEndCapture(stream, &graph),
+                       "musaStreamEndCapture(full_fitting)");
+    if (!status.ok()) return fail(status);
+
+    size_t node_count = 0;
+    status = CheckMusa(musaGraphGetNodes(graph, nullptr, &node_count),
+                       "musaGraphGetNodes(full_fitting)");
+    if (!status.ok()) return fail(status);
+    std::vector<musaGraphNode_t> nodes(node_count);
+    size_t fetched = node_count;
+    status = CheckMusa(
+        musaGraphGetNodes(graph, nodes.data(), &fetched),
+        "musaGraphGetNodes(full_fitting,data)");
+    if (!status.ok()) return fail(status);
+    size_t kernel_count = 0;
+    for (musaGraphNode_t node : nodes) {
+      musaGraphNodeType type;
+      status = CheckMusa(musaGraphNodeGetType(node, &type),
+                         "musaGraphNodeGetType(full_fitting)");
+      if (!status.ok()) return fail(status);
+      if (type == musaGraphNodeTypeKernel) ++kernel_count;
+    }
+
+    status = CheckMusa(musaGraphInstantiate(&exec, graph, 0),
+                       "musaGraphInstantiate(full_fitting)");
+    if (!status.ok()) return fail(status);
+    status = CheckMusa(musaGraphLaunch(exec, stream), "musaGraphLaunch(1)");
+    if (!status.ok()) return fail(status);
+    status = CheckMusa(musaStreamSynchronize(stream), "sync(replay1)");
+    if (!status.ok()) return fail(status);
+    status = CheckMusa(
+        musaMemcpyAsync(replay1_dev, final_dev, sizeof(float) * kM,
+                        musaMemcpyDeviceToDevice, stream),
+        "copy(replay1)");
+    if (!status.ok()) return fail(status);
+    status = CheckMusa(musaStreamSynchronize(stream), "sync(replay1_copy)");
+    if (!status.ok()) return fail(status);
+    status = CheckMusa(musaGraphLaunch(exec, stream), "musaGraphLaunch(2)");
+    if (!status.ok()) return fail(status);
+    status = CheckMusa(musaStreamSynchronize(stream), "sync(replay2)");
+    if (!status.ok()) return fail(status);
+    status = CheckMusa(
+        musaMemcpyAsync(output->flat<float>().data(), final_dev,
+                        sizeof(float) * kM, musaMemcpyDeviceToDevice, stream),
+        "copy(final)");
+    if (!status.ok()) return fail(status);
+    status = CheckMusa(musaStreamSynchronize(stream), "sync(final)");
+    if (!status.ok()) return fail(status);
+
+    std::vector<float> replay1(kM);
+    std::vector<float> replay2(kM);
+    status = CheckMusa(musaMemcpy(replay1.data(), replay1_dev,
+                                  sizeof(float) * kM,
+                                  musaMemcpyDeviceToHost),
+                       "musaMemcpy(replay1)");
+    if (!status.ok()) return fail(status);
+    status = CheckMusa(musaMemcpy(replay2.data(), final_dev,
+                                  sizeof(float) * kM,
+                                  musaMemcpyDeviceToHost),
+                       "musaMemcpy(replay2)");
+    if (!status.ok()) return fail(status);
+    if (std::memcmp(replay1.data(), replay2.data(),
+                    sizeof(float) * kM) != 0) {
+      return fail(errors::Internal("full fitting replay outputs differ"));
+    }
+    for (float value : replay2) {
+      if (!std::isfinite(value)) {
+        return fail(errors::Internal("full fitting output is not finite"));
+      }
+    }
+
+    unsigned int tick_count = 0;
+    status = CheckMusa(musaMemcpy(&tick_count, counter, sizeof(tick_count),
+                                  musaMemcpyDeviceToHost),
+                       "musaMemcpy(counter)");
+    if (!status.ok()) return fail(status);
+    if (tick_count != 2) {
+      return fail(errors::Internal("full fitting replay count mismatch: ",
+                                   tick_count));
+    }
+    std::fprintf(stderr,
+                 "MANUAL_FULL_FITTING_PROBE nodes=%zu kernels=%zu tick=2 "
+                 "shape=%dx1 replay_bitwise=1 finite=1\n",
+                 node_count, kernel_count, kM);
+    cleanup();
+  }
+};
+
+}  // namespace
+
+REGISTER_OP("MusaManualGraphFullFitting")
+    .Input("x: float")
+    .Input("w0: float")
+    .Input("b0: float")
+    .Input("w1: float")
+    .Input("b1: float")
+    .Input("w2: float")
+    .Input("b2: float")
+    .Input("wf: float")
+    .Input("bf: float")
+    .Input("idt1: float")
+    .Input("idt2: float")
+    .Output("output: float")
+    .SetIsStateful()
+    .SetShapeFn([](shape_inference::InferenceContext* c) {
+      c->set_output(0, c->MakeShape({kM, 1}));
+      return OkStatus();
+    });
+
+REGISTER_KERNEL_BUILDER(
+    Name("MusaManualGraphFullFitting").Device("MUSA"),
+    MusaManualGraphFullFittingOp);
+
+}  // namespace musa
+}  // namespace tensorflow
