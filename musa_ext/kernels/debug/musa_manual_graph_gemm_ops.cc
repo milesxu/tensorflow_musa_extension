@@ -53,6 +53,18 @@ class MusaManualGraphGemmOp : public OpKernel {
     musaGraphExec_t exec = nullptr;
 
     auto cleanup = [&]() {
+      if (stream != nullptr) {
+        musaStreamCaptureStatus capture_status = musaStreamCaptureStatusNone;
+        if (musaStreamIsCapturing(stream, &capture_status) == musaSuccess &&
+            capture_status == musaStreamCaptureStatusActive) {
+          musaGraph_t aborted = nullptr;
+          musaStreamEndCapture(stream, &aborted);
+          if (aborted != nullptr) {
+            musaGraphDestroy(aborted);
+          }
+        }
+        musaStreamSynchronize(stream);
+      }
       if (exec != nullptr) {
         musaGraphExecDestroy(exec);
         exec = nullptr;
@@ -158,12 +170,27 @@ class MusaManualGraphGemmOp : public OpKernel {
     }
     status = CheckMusa(musaStreamEndCapture(stream, &graph),
                        "musaStreamEndCapture(manual_gemm)");
-    if (!status.ok()) return fail(status);
+    if (!status.ok()) {
+      musaStreamCaptureStatus capture_status = musaStreamCaptureStatusNone;
+      if (musaStreamIsCapturing(stream, &capture_status) == musaSuccess &&
+          capture_status == musaStreamCaptureStatusActive) {
+        musaGraph_t aborted = nullptr;
+        musaStreamEndCapture(stream, &aborted);
+        if (aborted != nullptr) {
+          musaGraphDestroy(aborted);
+        }
+      }
+      return fail(status);
+    }
 
     size_t node_count = 0;
     status = CheckMusa(musaGraphGetNodes(graph, nullptr, &node_count),
                        "musaGraphGetNodes(gemm)");
     if (!status.ok()) return fail(status);
+    if (node_count != 1) {
+      return fail(errors::Internal("unexpected captured graph node count: ",
+                                   node_count));
+    }
     std::vector<musaGraphNode_t> nodes(node_count);
     size_t fetched = node_count;
     status = CheckMusa(
@@ -181,14 +208,20 @@ class MusaManualGraphGemmOp : public OpKernel {
         kernel_nodes.push_back(node);
       }
     }
-    if (kernel_nodes.empty()) {
-      return fail(errors::Internal("muBLAS capture produced no kernel node"));
+    if (kernel_nodes.size() != 1) {
+      return fail(errors::Internal(
+          "muBLAS capture produced unexpected kernel count: ",
+          kernel_nodes.size()));
     }
 
+    void* tick_kernel = MusaGraphCounterTickKernelAddress();
+    if (tick_kernel == nullptr) {
+      return fail(errors::Internal("counter tick kernel address is null"));
+    }
     unsigned int* tick_arg = counter;
     void* tick_args[] = {&tick_arg};
     musaKernelNodeParams tick_params{};
-    tick_params.func = MusaGraphCounterTickKernelAddress();
+    tick_params.func = tick_kernel;
     tick_params.gridDim = dim3(1, 1, 1);
     tick_params.blockDim = dim3(1, 1, 1);
     tick_params.sharedMemBytes = 0;
