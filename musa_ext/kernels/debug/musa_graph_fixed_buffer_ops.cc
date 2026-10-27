@@ -244,6 +244,11 @@ class MusaFixedGraphCaptureBeginOp : public OpKernel {
     unsigned int* counter = nullptr;
     auto fail = [&](const Status& status) {
       if (counter != nullptr) {
+        std::fprintf(stderr,
+                     "FIXED_GRAPH_COUNTER_FREE handle=%lld generation=%lld "
+                     "counter=%p reason=begin_failure\n",
+                     static_cast<long long>(handle_),
+                     static_cast<long long>(generation_), counter);
         musaFree(counter);
         counter = nullptr;
       }
@@ -258,6 +263,11 @@ class MusaFixedGraphCaptureBeginOp : public OpKernel {
       fail(status);
       return;
     }
+    std::fprintf(stderr,
+                 "FIXED_GRAPH_COUNTER_ALLOC handle=%lld generation=%lld "
+                 "counter=%p\n",
+                 static_cast<long long>(handle_),
+                 static_cast<long long>(generation_), counter);
     status = CheckMusa(musaMemset(counter, 0, sizeof(*counter)),
                        "musaMemset(counter)");
     if (!status.ok()) {
@@ -948,6 +958,11 @@ class MusaFixedGraphReleaseOp : public OpKernel {
       }
     }
     if (state->counter != nullptr) {
+      std::fprintf(stderr,
+                   "FIXED_GRAPH_COUNTER_FREE handle=%lld generation=%lld "
+                   "counter=%p reason=release\n",
+                   static_cast<long long>(handle_),
+                   static_cast<long long>(generation_), state->counter);
       const Status status = CheckMusa(musaFree(state->counter), "musaFree");
       if (!status.ok()) {
         fail_cleanup(status);
