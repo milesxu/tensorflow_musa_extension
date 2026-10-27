@@ -6,6 +6,7 @@
 
 #include <musa_runtime.h>
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstdio>
@@ -13,6 +14,8 @@
 #include <mutex>
 #include <unordered_map>
 #include <vector>
+
+#include "mu/device/musa_capture_event_registry.h"
 
 extern "C" void LaunchMusaGraphCounterTick(unsigned int* counter,
                                            musaStream_t stream);
@@ -22,9 +25,17 @@ namespace tensorflow {
 namespace musa {
 namespace {
 
+enum class FixedGraphPhase {
+  kCapturing,
+  kReady,
+  kFailed,
+  kReplaying,
+};
+
 struct FixedGraphState {
   std::mutex mutex;
   int64_t handle = 0;
+  int64_t generation = 0;
   int device_id = -1;
   musaStream_t stream = nullptr;
   unsigned long long capture_id = 0;
@@ -43,7 +54,9 @@ struct FixedGraphState {
   int capture_count = 0;
   int retain_calls = 0;
   int replay_count = 0;
-  bool capture_active = false;
+  size_t capture_event_count = 0;
+  std::vector<musaEvent_t> capture_events;
+  FixedGraphPhase phase = FixedGraphPhase::kCapturing;
 };
 
 using FixedGraphStatePtr = std::shared_ptr<FixedGraphState>;
@@ -58,18 +71,23 @@ std::unordered_map<int64_t, FixedGraphStatePtr>& FixedGraphs() {
   return graphs;
 }
 
-FixedGraphStatePtr FindFixedGraph(int64_t handle) {
+FixedGraphStatePtr FindFixedGraph(int64_t handle, int64_t generation) {
   std::lock_guard<std::mutex> lock(FixedGraphMutex());
   auto& graphs = FixedGraphs();
   auto it = graphs.find(handle);
-  return it == graphs.end() ? nullptr : it->second;
+  if (it == graphs.end() || it->second->generation != generation) {
+    return nullptr;
+  }
+  return it->second;
 }
 
-void RemoveFixedGraph(int64_t handle, const FixedGraphStatePtr& expected) {
+void RemoveFixedGraph(int64_t handle, int64_t generation,
+                      const FixedGraphStatePtr& expected) {
   std::lock_guard<std::mutex> lock(FixedGraphMutex());
   auto& graphs = FixedGraphs();
   auto it = graphs.find(handle);
-  if (it != graphs.end() && it->second == expected) {
+  if (it != graphs.end() && it->second == expected &&
+      it->second->generation == generation) {
     graphs.erase(it);
   }
 }
@@ -80,6 +98,44 @@ Status CheckMusa(musaError_t status, const char* call) {
   }
   return errors::Internal(call, " failed with MUSA error ",
                           static_cast<int>(status));
+}
+
+Status ValidateFixedGraphContext(OpKernelContext* ctx,
+                                 const FixedGraphStatePtr& state,
+                                 FixedGraphPhase required_phase,
+                                 const char* operation) {
+  if (GetMusaDeviceIdByCtx(ctx) != state->device_id) {
+    return errors::FailedPrecondition(operation, " device mismatch");
+  }
+  if (GetMusaStreamByCtx(ctx) != state->stream) {
+    return errors::FailedPrecondition(operation, " stream mismatch");
+  }
+  if (state->phase != required_phase) {
+    return errors::FailedPrecondition(operation, " invalid graph phase");
+  }
+  return OkStatus();
+}
+
+Status DestroyCaptureEvents(std::vector<musaEvent_t>* events, int device_id) {
+  if (events == nullptr || events->empty()) {
+    return OkStatus();
+  }
+  if (device_id >= 0) {
+    musaSetDevice(device_id);
+  }
+  Status first_error = OkStatus();
+  for (musaEvent_t event : *events) {
+    const musaError_t err = musaEventDestroy(event);
+    if (err != musaSuccess && first_error.ok()) {
+      first_error = errors::Internal("musaEventDestroy failed: ",
+                                     static_cast<int>(err));
+    }
+  }
+  const size_t destroyed = events->size();
+  events->clear();
+  std::fprintf(stderr, "FIXED_GRAPH_EVENT_DESTROY count=%zu status=%s\n",
+               destroyed, first_error.ok() ? "OK" : "ERROR");
+  return first_error;
 }
 
 Status GetActiveCaptureInfo(musaStream_t stream,
@@ -152,67 +208,108 @@ class MusaFixedGraphCaptureBeginOp : public OpKernel {
   explicit MusaFixedGraphCaptureBeginOp(OpKernelConstruction* ctx)
       : OpKernel(ctx) {
     OP_REQUIRES_OK(ctx, ctx->GetAttr("handle", &handle_));
+    OP_REQUIRES_OK(ctx, ctx->GetAttr("generation", &generation_));
   }
 
   void Compute(OpKernelContext* ctx) override {
-    std::fprintf(stderr, "FIXED_GRAPH_BEGIN_ENTER handle=%lld\n",
-                 static_cast<long long>(handle_));
+    std::fprintf(stderr,
+                 "FIXED_GRAPH_BEGIN_ENTER handle=%lld generation=%lld\n",
+                 static_cast<long long>(handle_),
+                 static_cast<long long>(generation_));
     Tensor* token = nullptr;
     OP_REQUIRES_OK(ctx, ctx->allocate_output(0, TensorShape({}), &token));
 
     auto state = std::make_shared<FixedGraphState>();
     state->handle = handle_;
+    state->generation = generation_;
     state->device_id = GetMusaDeviceIdByCtx(ctx);
     state->stream = GetMusaStreamByCtx(ctx);
-    OP_REQUIRES(ctx, state->device_id >= 0 && state->stream != nullptr,
-                errors::FailedPrecondition("invalid MUSA device or stream"));
+    if (state->device_id < 0 || state->stream == nullptr) {
+      ctx->CtxFailure(
+          errors::FailedPrecondition("invalid MUSA device or stream"));
+      return;
+    }
 
     {
       std::lock_guard<std::mutex> lock(FixedGraphMutex());
       auto& graphs = FixedGraphs();
-      OP_REQUIRES(ctx, graphs.find(handle_) == graphs.end(),
-                  errors::AlreadyExists("fixed graph handle already exists: ",
-                                        handle_));
+      if (graphs.find(handle_) != graphs.end()) {
+        ctx->CtxFailure(errors::AlreadyExists(
+            "fixed graph handle already exists: ", handle_));
+        return;
+      }
       graphs.emplace(handle_, state);
     }
-    std::fprintf(stderr, "FIXED_GRAPH_BEGIN_STATE handle=%lld\n",
-                 static_cast<long long>(handle_));
 
     unsigned int* counter = nullptr;
-    OP_REQUIRES_OK(
-        ctx, CheckMusa(musaMalloc(reinterpret_cast<void**>(&counter),
-                                  sizeof(*counter)),
-                       "musaMalloc(counter)"));
-    std::fprintf(stderr, "FIXED_GRAPH_BEGIN_MALLOC handle=%lld counter=%p\n",
-                 static_cast<long long>(handle_), counter);
-    OP_REQUIRES_OK(ctx, CheckMusa(musaMemset(counter, 0, sizeof(*counter)),
-                                  "musaMemset(counter)"));
-    OP_REQUIRES_OK(ctx, CheckMusa(musaStreamSynchronize(state->stream),
-                                  "musaStreamSynchronize(counter)"));
+    auto fail = [&](const Status& status) {
+      if (counter != nullptr) {
+        musaFree(counter);
+        counter = nullptr;
+      }
+      RemoveFixedGraph(handle_, generation_, state);
+      ctx->CtxFailure(status);
+    };
+
+    Status status =
+        CheckMusa(musaMalloc(reinterpret_cast<void**>(&counter),
+                             sizeof(*counter)),
+                  "musaMalloc(counter)");
+    if (!status.ok()) {
+      fail(status);
+      return;
+    }
+    status = CheckMusa(musaMemset(counter, 0, sizeof(*counter)),
+                       "musaMemset(counter)");
+    if (!status.ok()) {
+      fail(status);
+      return;
+    }
+    status = CheckMusa(musaStreamSynchronize(state->stream),
+                       "musaStreamSynchronize(counter)");
+    if (!status.ok()) {
+      fail(status);
+      return;
+    }
 
     {
       std::lock_guard<std::mutex> lock(state->mutex);
       state->counter = counter;
     }
 
-    OP_REQUIRES_OK(ctx, CheckMusa(
-                            musaStreamBeginCapture(
-                                state->stream, musaStreamCaptureModeRelaxed),
-                            "musaStreamBeginCapture"));
+    status = CheckMusa(
+        musaStreamBeginCapture(state->stream, musaStreamCaptureModeRelaxed),
+        "musaStreamBeginCapture");
+    if (!status.ok()) {
+      fail(status);
+      return;
+    }
     unsigned long long capture_id = 0;
-    OP_REQUIRES_OK(ctx, GetActiveCaptureInfo(state->stream, &capture_id));
+    status = GetActiveCaptureInfo(state->stream, &capture_id);
+    if (!status.ok()) {
+      musaGraph_t aborted_graph = nullptr;
+      musaStreamEndCapture(state->stream, &aborted_graph);
+      if (aborted_graph != nullptr) {
+        musaGraphDestroy(aborted_graph);
+      }
+      fail(status);
+      return;
+    }
     {
       std::lock_guard<std::mutex> lock(state->mutex);
       state->capture_id = capture_id;
-      state->capture_active = true;
     }
     std::fprintf(stderr,
-                 "FIXED_GRAPH_BEGIN handle=%lld device=%d capture_id=%llu\n",
-                 static_cast<long long>(handle_), state->device_id, capture_id);
+                 "FIXED_GRAPH_BEGIN handle=%lld generation=%lld device=%d "
+                 "capture_id=%llu counter=%p\n",
+                 static_cast<long long>(handle_),
+                 static_cast<long long>(generation_), state->device_id,
+                 capture_id, counter);
   }
 
  private:
   int64_t handle_;
+  int64_t generation_ = 0;
 };
 
 template <typename T>
@@ -221,6 +318,7 @@ class MusaFixedGraphRetainTensorsOp : public OpKernel {
   explicit MusaFixedGraphRetainTensorsOp(OpKernelConstruction* ctx)
       : OpKernel(ctx) {
     OP_REQUIRES_OK(ctx, ctx->GetAttr("handle", &handle_));
+    OP_REQUIRES_OK(ctx, ctx->GetAttr("generation", &generation_));
   }
 
   void Compute(OpKernelContext* ctx) override {
@@ -229,15 +327,13 @@ class MusaFixedGraphRetainTensorsOp : public OpKernel {
     Tensor* token = nullptr;
     OP_REQUIRES_OK(ctx, ctx->allocate_output(0, TensorShape({}), &token));
 
-    auto state = FindFixedGraph(handle_);
+    auto state = FindFixedGraph(handle_, generation_);
     OP_REQUIRES(ctx, state != nullptr,
                 errors::NotFound("fixed graph handle not found: ", handle_));
-    OP_REQUIRES(ctx, GetMusaDeviceIdByCtx(ctx) == state->device_id,
-                errors::FailedPrecondition("retain device mismatch"));
 
     std::lock_guard<std::mutex> lock(state->mutex);
-    OP_REQUIRES(ctx, state->capture_active && state->capture_count == 0,
-                errors::FailedPrecondition("retain outside active capture"));
+    OP_REQUIRES_OK(ctx, ValidateFixedGraphContext(
+                            ctx, state, FixedGraphPhase::kCapturing, "retain"));
     state->a = ctx->input(0);
     state->b = ctx->input(1);
     state->c = ctx->input(2);
@@ -255,6 +351,7 @@ class MusaFixedGraphRetainTensorsOp : public OpKernel {
 
  private:
   int64_t handle_;
+  int64_t generation_ = 0;
 };
 
 class MusaFixedGraphCounterTickOp : public OpKernel {
@@ -262,21 +359,22 @@ class MusaFixedGraphCounterTickOp : public OpKernel {
   explicit MusaFixedGraphCounterTickOp(OpKernelConstruction* ctx)
       : OpKernel(ctx) {
     OP_REQUIRES_OK(ctx, ctx->GetAttr("handle", &handle_));
+    OP_REQUIRES_OK(ctx, ctx->GetAttr("generation", &generation_));
   }
 
   void Compute(OpKernelContext* ctx) override {
     Tensor* token = nullptr;
     OP_REQUIRES_OK(ctx, ctx->allocate_output(0, TensorShape({}), &token));
 
-    auto state = FindFixedGraph(handle_);
+    auto state = FindFixedGraph(handle_, generation_);
     OP_REQUIRES(ctx, state != nullptr,
                 errors::NotFound("fixed graph handle not found: ", handle_));
-    OP_REQUIRES(ctx, GetMusaDeviceIdByCtx(ctx) == state->device_id,
-                errors::FailedPrecondition("tick device mismatch"));
 
     std::lock_guard<std::mutex> lock(state->mutex);
-    OP_REQUIRES(ctx, state->capture_active && state->counter != nullptr,
-                errors::FailedPrecondition("tick outside active capture"));
+    OP_REQUIRES_OK(ctx, ValidateFixedGraphContext(
+                            ctx, state, FixedGraphPhase::kCapturing, "tick"));
+    OP_REQUIRES(ctx, state->counter != nullptr,
+                errors::FailedPrecondition("tick counter is null"));
     LaunchMusaGraphCounterTick(state->counter, GetMusaStreamByCtx(ctx));
     OP_REQUIRES_OK(ctx, CheckMusa(musaGetLastError(),
                                   "LaunchMusaGraphCounterTick"));
@@ -284,6 +382,7 @@ class MusaFixedGraphCounterTickOp : public OpKernel {
 
  private:
   int64_t handle_;
+  int64_t generation_ = 0;
 };
 
 class MusaFixedGraphCaptureEndOp : public OpKernel {
@@ -291,6 +390,7 @@ class MusaFixedGraphCaptureEndOp : public OpKernel {
   explicit MusaFixedGraphCaptureEndOp(OpKernelConstruction* ctx)
       : OpKernel(ctx) {
     OP_REQUIRES_OK(ctx, ctx->GetAttr("handle", &handle_));
+    OP_REQUIRES_OK(ctx, ctx->GetAttr("generation", &generation_));
   }
 
   void Compute(OpKernelContext* ctx) override {
@@ -298,125 +398,186 @@ class MusaFixedGraphCaptureEndOp : public OpKernel {
     OP_REQUIRES_OK(ctx, ctx->allocate_output(0, TensorShape({}), &token));
     (void)ctx->input(0);
 
-    auto state = FindFixedGraph(handle_);
+    auto state = FindFixedGraph(handle_, generation_);
     OP_REQUIRES(ctx, state != nullptr,
                 errors::NotFound("fixed graph handle not found: ", handle_));
-    OP_REQUIRES(ctx, GetMusaDeviceIdByCtx(ctx) == state->device_id,
-                errors::FailedPrecondition("capture end device mismatch"));
-    OP_REQUIRES(ctx, GetMusaStreamByCtx(ctx) == state->stream,
-                errors::FailedPrecondition("capture end stream mismatch"));
 
     std::lock_guard<std::mutex> lock(state->mutex);
-    OP_REQUIRES(ctx, state->capture_active && state->capture_count == 0,
-                errors::FailedPrecondition("capture is not active"));
-    OP_REQUIRES(ctx,
-                state->a.IsInitialized() && state->b.IsInitialized() &&
-                    state->c.IsInitialized(),
-                errors::FailedPrecondition("capture tensors were not retained"));
+    Status status = ValidateFixedGraphContext(
+        ctx, state, FixedGraphPhase::kCapturing, "capture_end");
+    auto fail = [&](const Status& failure) {
+      state->phase = FixedGraphPhase::kFailed;
+      ctx->CtxFailure(failure);
+    };
+    if (!status.ok()) {
+      fail(status);
+      return;
+    }
+    if (!state->a.IsInitialized() || !state->b.IsInitialized() ||
+        !state->c.IsInitialized()) {
+      fail(errors::FailedPrecondition(
+          "capture tensors were not retained"));
+      return;
+    }
 
     musaGraph_t graph = nullptr;
-    OP_REQUIRES_OK(ctx, CheckMusa(musaStreamEndCapture(state->stream, &graph),
-                                  "musaStreamEndCapture"));
+    status = CheckMusa(musaStreamEndCapture(state->stream, &graph),
+                       "musaStreamEndCapture");
+    if (!status.ok()) {
+      fail(status);
+      return;
+    }
     state->graph = graph;
-    state->capture_active = false;
+    state->capture_events = TakeCaptureDependencyEvents(state->capture_id);
+    state->capture_event_count = state->capture_events.size();
 
-    OP_REQUIRES_OK(
-        ctx, InspectGraph(graph, MusaGraphCounterTickKernelAddress(),
+    status = InspectGraph(graph, MusaGraphCounterTickKernelAddress(),
                           &state->node_count, &state->kernel_nodes,
-                          &state->tick_kernel_nodes));
-    OP_REQUIRES(ctx, state->kernel_nodes >= 2,
-                errors::Internal("captured graph has fewer than 2 kernels"));
-    OP_REQUIRES(ctx, state->tick_kernel_nodes == 1,
-                errors::Internal("captured graph tick kernel count is ",
-                                 state->tick_kernel_nodes));
+                          &state->tick_kernel_nodes);
+    if (!status.ok()) {
+      fail(status);
+      return;
+    }
+    if (state->kernel_nodes < 2) {
+      fail(errors::Internal("captured graph has fewer than 2 kernels"));
+      return;
+    }
+    if (state->tick_kernel_nodes != 1) {
+      fail(errors::Internal("captured graph tick kernel count is ",
+                            state->tick_kernel_nodes));
+      return;
+    }
 
-    OP_REQUIRES_OK(ctx, CheckMusa(musaGraphInstantiate(&state->exec, graph, 0),
-                                  "musaGraphInstantiate"));
-    OP_REQUIRES_OK(ctx, CheckMusa(musaStreamSynchronize(state->stream),
-                                  "musaStreamSynchronize(capture)"));
+    status = CheckMusa(musaGraphInstantiate(&state->exec, graph, 0),
+                       "musaGraphInstantiate");
+    if (!status.ok()) {
+      fail(status);
+      return;
+    }
+    status = CheckMusa(musaStreamSynchronize(state->stream),
+                       "musaStreamSynchronize(capture)");
+    if (!status.ok()) {
+      fail(status);
+      return;
+    }
 
     unsigned int counter_after_capture = 0;
-    OP_REQUIRES_OK(
-        ctx, CheckMusa(musaMemcpy(&counter_after_capture, state->counter,
+    status = CheckMusa(musaMemcpy(&counter_after_capture, state->counter,
                                   sizeof(counter_after_capture),
                                   musaMemcpyDeviceToHost),
-                       "musaMemcpy(counter_after_capture)"));
-    OP_REQUIRES(ctx, counter_after_capture == 0,
-                errors::Internal("captured tick executed during capture: ",
-                                 counter_after_capture));
+                       "musaMemcpy(counter_after_capture)");
+    if (!status.ok()) {
+      fail(status);
+      return;
+    }
+    if (counter_after_capture != 0) {
+      fail(errors::Internal("captured tick executed during capture: ",
+                            counter_after_capture));
+      return;
+    }
 
+    state->phase = FixedGraphPhase::kReady;
     state->capture_count = 1;
     std::fprintf(
         stderr,
-        "FIXED_GRAPH_CAPTURE handle=%lld capture_id=%llu nodes=%zu kernels=%zu "
-        "tick_kernels=%zu retain_calls=%d counter=%u a=%p b=%p c=%p\n",
-        static_cast<long long>(handle_), state->capture_id, state->node_count,
-        state->kernel_nodes, state->tick_kernel_nodes, state->retain_calls,
-        counter_after_capture, state->a.data(), state->b.data(),
-        state->c.data());
+        "FIXED_GRAPH_CAPTURE handle=%lld generation=%lld capture_id=%llu "
+        "nodes=%zu kernels=%zu tick_kernels=%zu retain_calls=%d events=%zu "
+        "counter=%u a=%p b=%p c=%p\n",
+        static_cast<long long>(handle_),
+        static_cast<long long>(generation_), state->capture_id,
+        state->node_count, state->kernel_nodes, state->tick_kernel_nodes,
+        state->retain_calls, state->capture_event_count, counter_after_capture,
+        state->a.data(), state->b.data(), state->c.data());
   }
 
  private:
   int64_t handle_;
+  int64_t generation_ = 0;
 };
 
 class MusaFixedGraphReplayOp : public OpKernel {
  public:
   explicit MusaFixedGraphReplayOp(OpKernelConstruction* ctx) : OpKernel(ctx) {
     OP_REQUIRES_OK(ctx, ctx->GetAttr("handle", &handle_));
+    OP_REQUIRES_OK(ctx, ctx->GetAttr("generation", &generation_));
   }
 
   void Compute(OpKernelContext* ctx) override {
     Tensor* diagnostics = nullptr;
     OP_REQUIRES_OK(
-        ctx, ctx->allocate_output(0, TensorShape({7}), &diagnostics));
+        ctx, ctx->allocate_output(0, TensorShape({9}), &diagnostics));
 
-    auto state = FindFixedGraph(handle_);
+    auto state = FindFixedGraph(handle_, generation_);
     OP_REQUIRES(ctx, state != nullptr,
                 errors::NotFound("fixed graph handle not found: ", handle_));
-    OP_REQUIRES(ctx, GetMusaDeviceIdByCtx(ctx) == state->device_id,
-                errors::FailedPrecondition("replay device mismatch"));
-    OP_REQUIRES(ctx, GetMusaStreamByCtx(ctx) == state->stream,
-                errors::FailedPrecondition("replay stream mismatch"));
 
     std::lock_guard<std::mutex> lock(state->mutex);
-    OP_REQUIRES(ctx, state->capture_count == 1 && state->exec != nullptr &&
-                         state->counter != nullptr,
+    OP_REQUIRES_OK(ctx, ValidateFixedGraphContext(
+                            ctx, state, FixedGraphPhase::kReady, "replay"));
+    OP_REQUIRES(ctx, state->exec != nullptr && state->counter != nullptr,
                 errors::FailedPrecondition("fixed graph is not ready"));
+    state->phase = FixedGraphPhase::kReplaying;
+    auto fail = [&](const Status& failure) {
+      state->phase = FixedGraphPhase::kFailed;
+      ctx->CtxFailure(failure);
+    };
 
     unsigned int counter_before = 0;
-    OP_REQUIRES_OK(ctx, CheckMusa(musaStreamSynchronize(state->stream),
-                                  "musaStreamSynchronize(before_replay)"));
-    OP_REQUIRES_OK(
-        ctx, CheckMusa(musaMemcpy(&counter_before, state->counter,
+    Status status = CheckMusa(musaStreamSynchronize(state->stream),
+                              "musaStreamSynchronize(before_replay)");
+    if (!status.ok()) {
+      fail(status);
+      return;
+    }
+    status = CheckMusa(musaMemcpy(&counter_before, state->counter,
                                   sizeof(counter_before),
                                   musaMemcpyDeviceToHost),
-                       "musaMemcpy(counter_before)"));
-    OP_REQUIRES_OK(
-        ctx, CheckMusa(musaGraphLaunch(state->exec, state->stream),
-                       "musaGraphLaunch"));
-    OP_REQUIRES_OK(ctx, CheckMusa(musaStreamSynchronize(state->stream),
-                                  "musaStreamSynchronize(after_replay)"));
+                       "musaMemcpy(counter_before)");
+    if (!status.ok()) {
+      fail(status);
+      return;
+    }
+    status = CheckMusa(musaGraphLaunch(state->exec, state->stream),
+                       "musaGraphLaunch");
+    if (!status.ok()) {
+      fail(status);
+      return;
+    }
+    status = CheckMusa(musaStreamSynchronize(state->stream),
+                       "musaStreamSynchronize(after_replay)");
+    if (!status.ok()) {
+      fail(status);
+      return;
+    }
     unsigned int counter_after = 0;
-    OP_REQUIRES_OK(
-        ctx, CheckMusa(musaMemcpy(&counter_after, state->counter,
+    status = CheckMusa(musaMemcpy(&counter_after, state->counter,
                                   sizeof(counter_after),
                                   musaMemcpyDeviceToHost),
-                       "musaMemcpy(counter_after)"));
-    OP_REQUIRES(ctx, counter_after == counter_before + 1,
-                errors::Internal("replay tick count mismatch: before=",
-                                 counter_before, " after=", counter_after));
+                       "musaMemcpy(counter_after)");
+    if (!status.ok()) {
+      fail(status);
+      return;
+    }
+    if (counter_after != counter_before + 1) {
+      fail(errors::Internal("replay tick count mismatch: before=",
+                            counter_before, " after=", counter_after));
+      return;
+    }
 
     ++state->replay_count;
+    state->phase = FixedGraphPhase::kReady;
     std::fprintf(
         stderr,
-        "FIXED_GRAPH_REPLAY handle=%lld count=%d counter=%u->%u nodes=%zu "
-        "kernels=%zu tick_kernels=%zu retain_calls=%d\n",
-        static_cast<long long>(handle_), state->replay_count, counter_before,
-        counter_after, state->node_count, state->kernel_nodes,
-        state->tick_kernel_nodes, state->retain_calls);
+        "FIXED_GRAPH_REPLAY handle=%lld generation=%lld count=%d "
+        "counter=%u->%u nodes=%zu kernels=%zu tick_kernels=%zu "
+        "retain_calls=%d events=%zu\n",
+        static_cast<long long>(handle_),
+        static_cast<long long>(generation_), state->replay_count,
+        counter_before, counter_after, state->node_count, state->kernel_nodes,
+        state->tick_kernel_nodes, state->retain_calls,
+        state->capture_event_count);
 
-    std::array<int32, 7> values = {
+    std::array<int32, 9> values = {
         static_cast<int32>(counter_before),
         static_cast<int32>(counter_after),
         static_cast<int32>(state->node_count),
@@ -424,6 +585,8 @@ class MusaFixedGraphReplayOp : public OpKernel {
         static_cast<int32>(state->tick_kernel_nodes),
         state->retain_calls,
         state->replay_count,
+        static_cast<int32>(state->capture_event_count),
+        static_cast<int32>(state->generation),
     };
     OP_REQUIRES_OK(
         ctx, CheckMusa(musaMemcpy(diagnostics->flat<int32>().data(),
@@ -434,6 +597,7 @@ class MusaFixedGraphReplayOp : public OpKernel {
 
  private:
   int64_t handle_;
+  int64_t generation_ = 0;
 };
 
 class MusaFixedGraphZeroOutputOp : public OpKernel {
@@ -441,20 +605,21 @@ class MusaFixedGraphZeroOutputOp : public OpKernel {
   explicit MusaFixedGraphZeroOutputOp(OpKernelConstruction* ctx)
       : OpKernel(ctx) {
     OP_REQUIRES_OK(ctx, ctx->GetAttr("handle", &handle_));
+    OP_REQUIRES_OK(ctx, ctx->GetAttr("generation", &generation_));
   }
 
   void Compute(OpKernelContext* ctx) override {
     Tensor* token = nullptr;
     OP_REQUIRES_OK(ctx, ctx->allocate_output(0, TensorShape({}), &token));
 
-    auto state = FindFixedGraph(handle_);
+    auto state = FindFixedGraph(handle_, generation_);
     OP_REQUIRES(ctx, state != nullptr,
                 errors::NotFound("fixed graph handle not found: ", handle_));
-    OP_REQUIRES(ctx, GetMusaDeviceIdByCtx(ctx) == state->device_id,
-                errors::FailedPrecondition("zero device mismatch"));
 
     std::lock_guard<std::mutex> lock(state->mutex);
-    OP_REQUIRES(ctx, state->capture_count == 1 && state->c.IsInitialized(),
+    OP_REQUIRES_OK(ctx, ValidateFixedGraphContext(
+                            ctx, state, FixedGraphPhase::kReady, "zero"));
+    OP_REQUIRES(ctx, state->c.IsInitialized(),
                 errors::FailedPrecondition("fixed graph is not ready"));
     OP_REQUIRES_OK(
         ctx, CheckMusa(musaMemsetAsync(state->c.data(), 0, state->c.TotalBytes(),
@@ -466,6 +631,7 @@ class MusaFixedGraphZeroOutputOp : public OpKernel {
 
  private:
   int64_t handle_;
+  int64_t generation_ = 0;
 };
 
 template <typename T>
@@ -474,24 +640,21 @@ class MusaFixedGraphWriteInputOp : public OpKernel {
   explicit MusaFixedGraphWriteInputOp(OpKernelConstruction* ctx)
       : OpKernel(ctx) {
     OP_REQUIRES_OK(ctx, ctx->GetAttr("handle", &handle_));
+    OP_REQUIRES_OK(ctx, ctx->GetAttr("generation", &generation_));
   }
 
   void Compute(OpKernelContext* ctx) override {
     Tensor* token = nullptr;
     OP_REQUIRES_OK(ctx, ctx->allocate_output(0, TensorShape({}), &token));
 
-    auto state = FindFixedGraph(handle_);
+    auto state = FindFixedGraph(handle_, generation_);
     OP_REQUIRES(ctx, state != nullptr,
                 errors::NotFound("fixed graph handle not found: ", handle_));
-    OP_REQUIRES(ctx, GetMusaDeviceIdByCtx(ctx) == state->device_id,
-                errors::FailedPrecondition("write input device mismatch"));
-    OP_REQUIRES(ctx, GetMusaStreamByCtx(ctx) == state->stream,
-                errors::FailedPrecondition("write input stream mismatch"));
 
     std::lock_guard<std::mutex> lock(state->mutex);
-    OP_REQUIRES(ctx,
-                state->capture_count == 1 && state->a.IsInitialized() &&
-                    state->b.IsInitialized(),
+    OP_REQUIRES_OK(ctx, ValidateFixedGraphContext(
+                            ctx, state, FixedGraphPhase::kReady, "write_input"));
+    OP_REQUIRES(ctx, state->a.IsInitialized() && state->b.IsInitialized(),
                 errors::FailedPrecondition("fixed graph is not ready"));
     const Tensor& input_a = ctx->input(0);
     const Tensor& input_b = ctx->input(1);
@@ -527,6 +690,7 @@ class MusaFixedGraphWriteInputOp : public OpKernel {
 
  private:
   int64_t handle_;
+  int64_t generation_ = 0;
 };
 
 template <typename T>
@@ -535,19 +699,19 @@ class MusaFixedGraphReadOutputOp : public OpKernel {
   explicit MusaFixedGraphReadOutputOp(OpKernelConstruction* ctx)
       : OpKernel(ctx) {
     OP_REQUIRES_OK(ctx, ctx->GetAttr("handle", &handle_));
+    OP_REQUIRES_OK(ctx, ctx->GetAttr("generation", &generation_));
   }
 
   void Compute(OpKernelContext* ctx) override {
-    auto state = FindFixedGraph(handle_);
+    auto state = FindFixedGraph(handle_, generation_);
     OP_REQUIRES(ctx, state != nullptr,
                 errors::NotFound("fixed graph handle not found: ", handle_));
-    OP_REQUIRES(ctx, GetMusaDeviceIdByCtx(ctx) == state->device_id,
-                errors::FailedPrecondition("read device mismatch"));
 
     std::lock_guard<std::mutex> lock(state->mutex);
-    OP_REQUIRES(ctx,
-                state->capture_count == 1 && state->c.IsInitialized() &&
-                    state->c.dtype() == DataTypeToEnum<T>::value,
+    OP_REQUIRES_OK(ctx, ValidateFixedGraphContext(
+                            ctx, state, FixedGraphPhase::kReady, "read_output"));
+    OP_REQUIRES(ctx, state->c.IsInitialized() &&
+                         state->c.dtype() == DataTypeToEnum<T>::value,
                 errors::FailedPrecondition("fixed graph output is not ready"));
     OP_REQUIRES(ctx, ctx->input(0).shape() == state->c.shape(),
                 errors::InvalidArgument("read output shape mismatch"));
@@ -567,6 +731,7 @@ class MusaFixedGraphReadOutputOp : public OpKernel {
 
  private:
   int64_t handle_;
+  int64_t generation_ = 0;
 };
 
 template <typename T>
@@ -574,22 +739,21 @@ class MusaFixedGraphReadInputOp : public OpKernel {
  public:
   explicit MusaFixedGraphReadInputOp(OpKernelConstruction* ctx) : OpKernel(ctx) {
     OP_REQUIRES_OK(ctx, ctx->GetAttr("handle", &handle_));
+    OP_REQUIRES_OK(ctx, ctx->GetAttr("generation", &generation_));
     OP_REQUIRES_OK(ctx, ctx->GetAttr("which", &which_));
   }
 
   void Compute(OpKernelContext* ctx) override {
-    auto state = FindFixedGraph(handle_);
+    auto state = FindFixedGraph(handle_, generation_);
     OP_REQUIRES(ctx, state != nullptr,
                 errors::NotFound("fixed graph handle not found: ", handle_));
-    OP_REQUIRES(ctx, GetMusaDeviceIdByCtx(ctx) == state->device_id,
-                errors::FailedPrecondition("read inputs device mismatch"));
 
     std::lock_guard<std::mutex> lock(state->mutex);
-    OP_REQUIRES(ctx,
-                state->capture_count == 1 && state->a.IsInitialized() &&
-                    state->b.IsInitialized() &&
-                    state->a.dtype() == DataTypeToEnum<T>::value &&
-                    state->b.dtype() == DataTypeToEnum<T>::value,
+    OP_REQUIRES_OK(ctx, ValidateFixedGraphContext(
+                            ctx, state, FixedGraphPhase::kReady, "read_input"));
+    OP_REQUIRES(ctx, state->a.IsInitialized() && state->b.IsInitialized() &&
+                         state->a.dtype() == DataTypeToEnum<T>::value &&
+                         state->b.dtype() == DataTypeToEnum<T>::value,
                 errors::FailedPrecondition("fixed graph inputs are not ready"));
 
     OP_REQUIRES(ctx, which_ == 0 || which_ == 1,
@@ -612,6 +776,7 @@ class MusaFixedGraphReadInputOp : public OpKernel {
 
  private:
   int64_t handle_;
+  int64_t generation_ = 0;
   int64_t which_ = 0;
 };
 
@@ -621,22 +786,22 @@ class MusaFixedGraphVerifyAddressesOp : public OpKernel {
   explicit MusaFixedGraphVerifyAddressesOp(OpKernelConstruction* ctx)
       : OpKernel(ctx) {
     OP_REQUIRES_OK(ctx, ctx->GetAttr("handle", &handle_));
+    OP_REQUIRES_OK(ctx, ctx->GetAttr("generation", &generation_));
   }
 
   void Compute(OpKernelContext* ctx) override {
     Tensor* token = nullptr;
     OP_REQUIRES_OK(ctx, ctx->allocate_output(0, TensorShape({}), &token));
 
-    auto state = FindFixedGraph(handle_);
+    auto state = FindFixedGraph(handle_, generation_);
     OP_REQUIRES(ctx, state != nullptr,
                 errors::NotFound("fixed graph handle not found: ", handle_));
-    OP_REQUIRES(ctx, GetMusaDeviceIdByCtx(ctx) == state->device_id,
-                errors::FailedPrecondition("verify device mismatch"));
 
     std::lock_guard<std::mutex> lock(state->mutex);
-    OP_REQUIRES(ctx,
-                state->capture_count == 1 && state->a.IsInitialized() &&
-                    state->b.IsInitialized() && state->c.IsInitialized(),
+    OP_REQUIRES_OK(ctx, ValidateFixedGraphContext(
+                            ctx, state, FixedGraphPhase::kReady, "verify"));
+    OP_REQUIRES(ctx, state->a.IsInitialized() && state->b.IsInitialized() &&
+                         state->c.IsInitialized(),
                 errors::FailedPrecondition("fixed graph tensors are not ready"));
     void* current_a = const_cast<T*>(ctx->input(0).flat<T>().data());
     void* current_b = const_cast<T*>(ctx->input(1).flat<T>().data());
@@ -655,65 +820,150 @@ class MusaFixedGraphVerifyAddressesOp : public OpKernel {
 
  private:
   int64_t handle_;
+  int64_t generation_ = 0;
 };
 
 class MusaFixedGraphReleaseOp : public OpKernel {
  public:
   explicit MusaFixedGraphReleaseOp(OpKernelConstruction* ctx) : OpKernel(ctx) {
     OP_REQUIRES_OK(ctx, ctx->GetAttr("handle", &handle_));
+    OP_REQUIRES_OK(ctx, ctx->GetAttr("generation", &generation_));
   }
 
   void Compute(OpKernelContext* ctx) override {
     Tensor* token = nullptr;
     OP_REQUIRES_OK(ctx, ctx->allocate_output(0, TensorShape({}), &token));
 
-    FixedGraphStatePtr state;
-    {
-      std::lock_guard<std::mutex> lock(FixedGraphMutex());
-      auto& graphs = FixedGraphs();
-      auto it = graphs.find(handle_);
-      if (it == graphs.end()) {
-        return;
-      }
-      state = it->second;
-      graphs.erase(it);
-    }
+    auto state = FindFixedGraph(handle_, generation_);
+    OP_REQUIRES(ctx, state != nullptr,
+                errors::NotFound("fixed graph handle/generation not found: ",
+                                 handle_, "/", generation_));
 
     std::lock_guard<std::mutex> lock(state->mutex);
-    OP_REQUIRES(ctx, !state->capture_active,
-                errors::FailedPrecondition("cannot release active capture"));
+    if (GetMusaDeviceIdByCtx(ctx) != state->device_id ||
+        GetMusaStreamByCtx(ctx) != state->stream) {
+      ctx->CtxFailure(
+          errors::FailedPrecondition("release context mismatch"));
+      return;
+    }
+    if (state->phase == FixedGraphPhase::kReplaying) {
+      ctx->CtxFailure(
+          errors::FailedPrecondition("cannot release while replaying"));
+      return;
+    }
     if (state->device_id >= 0) {
       musaSetDevice(state->device_id);
     }
+
+    if (state->phase == FixedGraphPhase::kCapturing) {
+      musaStreamCaptureStatus capture_status = musaStreamCaptureStatusNone;
+      Status status = CheckMusa(
+          musaStreamIsCapturing(state->stream, &capture_status),
+          "musaStreamIsCapturing(release)");
+      if (!status.ok()) {
+        state->phase = FixedGraphPhase::kFailed;
+        ctx->CtxFailure(status);
+        return;
+      }
+      if (capture_status == musaStreamCaptureStatusActive) {
+        musaGraph_t aborted_graph = nullptr;
+        status = CheckMusa(musaStreamEndCapture(state->stream, &aborted_graph),
+                           "musaStreamEndCapture(abort)");
+        if (!status.ok()) {
+          state->phase = FixedGraphPhase::kFailed;
+          ctx->CtxFailure(status);
+          return;
+        }
+        if (state->graph == nullptr) {
+          state->graph = aborted_graph;
+        } else if (aborted_graph != nullptr) {
+          musaGraphDestroy(aborted_graph);
+        }
+      }
+    }
+
+    if (state->capture_id != 0) {
+      std::vector<musaEvent_t> pending =
+          TakeCaptureDependencyEvents(state->capture_id);
+      state->capture_events.insert(state->capture_events.end(),
+                                   pending.begin(), pending.end());
+      state->capture_event_count =
+          std::max(state->capture_event_count, state->capture_events.size());
+    }
+
+    Status sync_status =
+        CheckMusa(musaStreamSynchronize(state->stream),
+                  "musaStreamSynchronize(release)");
+    if (!sync_status.ok()) {
+      state->phase = FixedGraphPhase::kFailed;
+      ctx->CtxFailure(sync_status);
+      return;
+    }
+
+    Status first_error = OkStatus();
+    auto record_error = [&](const Status& status) {
+      if (!status.ok() && first_error.ok()) {
+        first_error = status;
+      }
+    };
     if (state->exec != nullptr) {
-      OP_REQUIRES_OK(ctx, CheckMusa(musaGraphExecDestroy(state->exec),
-                                    "musaGraphExecDestroy"));
-      state->exec = nullptr;
+      const Status status = CheckMusa(musaGraphExecDestroy(state->exec),
+                                      "musaGraphExecDestroy");
+      record_error(status);
+      if (status.ok()) {
+        state->exec = nullptr;
+      }
     }
     if (state->graph != nullptr) {
-      OP_REQUIRES_OK(ctx, CheckMusa(musaGraphDestroy(state->graph),
-                                    "musaGraphDestroy"));
-      state->graph = nullptr;
+      const Status status =
+          CheckMusa(musaGraphDestroy(state->graph), "musaGraphDestroy");
+      record_error(status);
+      if (status.ok()) {
+        state->graph = nullptr;
+      }
     }
+    record_error(DestroyCaptureEvents(&state->capture_events,
+                                      state->device_id));
     if (state->counter != nullptr) {
-      OP_REQUIRES_OK(ctx, CheckMusa(musaFree(state->counter), "musaFree"));
-      state->counter = nullptr;
+      const Status status = CheckMusa(musaFree(state->counter), "musaFree");
+      record_error(status);
+      if (status.ok()) {
+        state->counter = nullptr;
+      }
     }
     state->a = Tensor();
     state->b = Tensor();
     state->c = Tensor();
-    std::fprintf(stderr, "FIXED_GRAPH_RELEASE handle=%lld\n",
-                 static_cast<long long>(handle_));
+    if (state->capture_id != 0 &&
+        PendingCaptureDependencyEventCount(state->capture_id) != 0) {
+      record_error(errors::Internal(
+          "capture dependency events remain after release"));
+    }
+    std::fprintf(stderr,
+                 "FIXED_GRAPH_RELEASE handle=%lld generation=%lld "
+                 "capture_id=%llu events=%zu status=%s\n",
+                 static_cast<long long>(handle_),
+                 static_cast<long long>(generation_), state->capture_id,
+                 state->capture_event_count,
+                 first_error.ok() ? "OK" : "ERROR");
+    if (!first_error.ok()) {
+      state->phase = FixedGraphPhase::kFailed;
+      ctx->CtxFailure(first_error);
+      return;
+    }
+    RemoveFixedGraph(handle_, generation_, state);
   }
 
  private:
   int64_t handle_;
+  int64_t generation_ = 0;
 };
 
 }  // namespace
 
 REGISTER_OP("MusaFixedGraphCaptureBegin")
     .Attr("handle: int = 1")
+    .Attr("generation: int = 0")
     .Output("token: int32")
     .SetIsStateful()
     .SetShapeFn([](shape_inference::InferenceContext* c) {
@@ -727,6 +977,7 @@ REGISTER_OP("MusaFixedGraphRetainTensors")
     .Input("c: T")
     .Attr("T: {float, double}")
     .Attr("handle: int = 1")
+    .Attr("generation: int = 0")
     .Output("token: int32")
     .SetIsStateful()
     .SetShapeFn([](shape_inference::InferenceContext* c) {
@@ -737,6 +988,7 @@ REGISTER_OP("MusaFixedGraphRetainTensors")
 REGISTER_OP("MusaFixedGraphCaptureEnd")
     .Input("trigger: int32")
     .Attr("handle: int = 1")
+    .Attr("generation: int = 0")
     .Output("token: int32")
     .SetIsStateful()
     .SetShapeFn([](shape_inference::InferenceContext* c) {
@@ -746,6 +998,7 @@ REGISTER_OP("MusaFixedGraphCaptureEnd")
 
 REGISTER_OP("MusaFixedGraphCounterTick")
     .Attr("handle: int = 1")
+    .Attr("generation: int = 0")
     .Output("token: int32")
     .SetIsStateful()
     .SetShapeFn([](shape_inference::InferenceContext* c) {
@@ -755,15 +1008,17 @@ REGISTER_OP("MusaFixedGraphCounterTick")
 
 REGISTER_OP("MusaFixedGraphReplay")
     .Attr("handle: int = 1")
+    .Attr("generation: int = 0")
     .Output("diagnostics: int32")
     .SetIsStateful()
     .SetShapeFn([](shape_inference::InferenceContext* c) {
-      c->set_output(0, c->Vector(7));
+      c->set_output(0, c->Vector(9));
       return OkStatus();
     });
 
 REGISTER_OP("MusaFixedGraphZeroOutput")
     .Attr("handle: int = 1")
+    .Attr("generation: int = 0")
     .Output("token: int32")
     .SetIsStateful()
     .SetShapeFn([](shape_inference::InferenceContext* c) {
@@ -776,6 +1031,7 @@ REGISTER_OP("MusaFixedGraphWriteInput")
     .Input("b: T")
     .Attr("T: {float, double}")
     .Attr("handle: int = 1")
+    .Attr("generation: int = 0")
     .Output("token: int32")
     .SetIsStateful()
     .SetShapeFn([](shape_inference::InferenceContext* c) {
@@ -787,6 +1043,7 @@ REGISTER_OP("MusaFixedGraphReadOutput")
     .Input("like: T")
     .Attr("T: {float, double}")
     .Attr("handle: int = 1")
+    .Attr("generation: int = 0")
     .Output("output: T")
     .SetIsStateful()
     .SetShapeFn([](shape_inference::InferenceContext* c) {
@@ -798,6 +1055,7 @@ REGISTER_OP("MusaFixedGraphReadInput")
     .Input("like: T")
     .Attr("T: {float, double}")
     .Attr("handle: int = 1")
+    .Attr("generation: int = 0")
     .Attr("which: int = 0")
     .Output("output: T")
     .SetIsStateful()
@@ -811,6 +1069,7 @@ REGISTER_OP("MusaFixedGraphVerifyAddresses")
     .Input("b: T")
     .Attr("T: {float, double}")
     .Attr("handle: int = 1")
+    .Attr("generation: int = 0")
     .Output("token: int32")
     .SetIsStateful()
     .SetShapeFn([](shape_inference::InferenceContext* c) {
@@ -820,6 +1079,7 @@ REGISTER_OP("MusaFixedGraphVerifyAddresses")
 
 REGISTER_OP("MusaFixedGraphRelease")
     .Attr("handle: int = 1")
+    .Attr("generation: int = 0")
     .Output("token: int32")
     .SetIsStateful()
     .SetShapeFn([](shape_inference::InferenceContext* c) {
