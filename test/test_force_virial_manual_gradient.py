@@ -65,9 +65,23 @@ def load_graph_def(with_manual_gradient):
     node_names = {node.name for node in pruned.node}
     stale = {
         "layer_0_type_0/MatMul",
+        "layer_0_type_0/BiasAdd",
+        "layer_0_type_0/Tanh",
+        "layer_0_type_0/Reshape",
         "layer_1_type_0/MatMul",
+        "layer_1_type_0/BiasAdd",
+        "layer_1_type_0/Tanh",
+        "layer_1_type_0/Reshape",
+        "layer_1_type_0/mul",
         "layer_2_type_0/MatMul",
+        "layer_2_type_0/BiasAdd",
+        "layer_2_type_0/Tanh",
+        "layer_2_type_0/Reshape",
+        "layer_2_type_0/mul",
+        "add_2",
+        "add_3",
         "final_layer_type_0/MatMul",
+        "final_layer_type_0/BiasAdd",
         "gradients/Reshape_18_grad/Reshape",
     }
     leaked = sorted(stale & node_names)
@@ -75,6 +89,32 @@ def load_graph_def(with_manual_gradient):
         raise RuntimeError(f"stale type-0 fitting nodes remain: {leaked}")
     if MANUAL_NODE not in node_names:
         raise RuntimeError("manual fitting node was pruned")
+    by_name = {node.name: node for node in pruned.node}
+    if by_name["Cast_7"].input[0] != f"{MANUAL_NODE}:0":
+        raise RuntimeError("Cast_7 is not wired to manual energy")
+    pad = by_name["gradients/Slice_3_grad/Pad"]
+    if pad.input[0] != f"{MANUAL_NODE}:1":
+        raise RuntimeError("Slice_3_grad/Pad is not wired to manual grad_x")
+    for required in [
+        "Reshape_24",
+        "ProdForceSeA",
+        "ProdVirialSeA",
+        "o_force",
+        "o_virial",
+    ]:
+        if required not in by_name:
+            raise RuntimeError(f"required force/virial node missing: {required}")
+    for name in [
+        "Cast_7",
+        "gradients/Slice_3_grad/Pad",
+        "Reshape_24",
+        "ProdForceSeA",
+        "ProdVirialSeA",
+        "o_force",
+        "o_virial",
+    ]:
+        node = by_name[name]
+        print("manual_graph_node", name, node.op, list(node.input))
     print("manual_pruned_nodes", len(pruned.node))
     print("manual_stale_type0_nodes", 0)
 
@@ -197,12 +237,12 @@ def main():
         print(f"manual_{name}_repeat_a1_a2_max_abs", repeat_12)
         print(f"manual_{name}_repeat_a2_a3_max_abs", repeat_23)
         print(f"manual_{name}_input_delta_max_abs", input_delta)
-    if repeat_12 > 1e-10 or repeat_23 > 1e-10:
-        raise RuntimeError(f"manual {name} repeat drift exceeds gate")
-    if name == "energy" and input_delta <= 1.0:
-        raise RuntimeError("manual energy did not react to input B")
-    if name in ("force", "virial") and input_delta <= 1e-3:
-        raise RuntimeError(f"manual {name} did not react to input B")
+        if repeat_12 > 1e-10 or repeat_23 > 1e-10:
+            raise RuntimeError(f"manual {name} repeat drift exceeds gate")
+        if name == "energy" and input_delta <= 1.0:
+            raise RuntimeError("manual energy did not react to input B")
+        if name in ("force", "virial") and input_delta <= 1e-3:
+            raise RuntimeError(f"manual {name} did not react to input B")
     print("manual_a_repeat_within_tolerance", True)
     print("manual_input_sensitivity", True)
 
@@ -218,6 +258,12 @@ def main():
     energy_musa_cpu_a = print_stats(
         "energy_musa_a_vs_cpu_a", musa_a[0], cpu_a[0]
     )
+    energy_manual_cpu_b = print_stats(
+        "energy_manual_b_vs_cpu_b", manual_b[0], cpu_b[0]
+    )
+    energy_musa_cpu_b = print_stats(
+        "energy_musa_b_vs_cpu_b", musa_b[0], cpu_b[0]
+    )
     force_manual_musa_a = print_stats(
         "force_manual_a_vs_musa_a", manual_a1[1], musa_a[1]
     )
@@ -229,6 +275,12 @@ def main():
     )
     force_musa_cpu_a = print_stats(
         "force_musa_a_vs_cpu_a", musa_a[1], cpu_a[1]
+    )
+    force_manual_cpu_b = print_stats(
+        "force_manual_b_vs_cpu_b", manual_b[1], cpu_b[1]
+    )
+    force_musa_cpu_b = print_stats(
+        "force_musa_b_vs_cpu_b", musa_b[1], cpu_b[1]
     )
     virial_manual_musa_a = print_stats(
         "virial_manual_a_vs_musa_a", manual_a1[2], musa_a[2]
@@ -242,6 +294,12 @@ def main():
     virial_musa_cpu_a = print_stats(
         "virial_musa_a_vs_cpu_a", musa_a[2], cpu_a[2]
     )
+    virial_manual_cpu_b = print_stats(
+        "virial_manual_b_vs_cpu_b", manual_b[2], cpu_b[2]
+    )
+    virial_musa_cpu_b = print_stats(
+        "virial_musa_b_vs_cpu_b", musa_b[2], cpu_b[2]
+    )
 
     for name, metrics in [
         ("energy_a", energy_manual_musa_a),
@@ -253,45 +311,44 @@ def main():
         ("force_a", force_manual_musa_a),
         ("force_b", force_manual_musa_b),
     ]:
-        if metrics["max_abs_diff"] > 0.5 or metrics["nrmse"] > 2e-3:
+        if metrics["max_abs_diff"] > 0.25 or metrics["nrmse"] > 1.5e-3:
             raise RuntimeError(f"{name} manual/MUSA gate failed")
     for name, metrics in [
         ("virial_a", virial_manual_musa_a),
         ("virial_b", virial_manual_musa_b),
     ]:
-        if metrics["max_abs_diff"] > 1.0 or metrics["nrmse"] > 5e-5:
+        if metrics["max_abs_diff"] > 0.75 or metrics["nrmse"] > 3e-5:
             raise RuntimeError(f"{name} manual/MUSA gate failed")
 
-    def relative_gate(name, manual, baseline, max_floor, nrmse_floor):
-        if manual["max_abs_diff"] > max(
-            baseline["max_abs_diff"] * 1.5, max_floor
-        ):
+    def relative_gate(name, manual, baseline):
+        if manual["max_abs_diff"] > baseline["max_abs_diff"] * 1.5:
             raise RuntimeError(f"{name} max_abs exceeds MUSA/CPU baseline")
-        if manual["nrmse"] > max(
-            baseline["nrmse"] * 1.5, nrmse_floor
-        ):
+        if manual["nrmse"] > baseline["nrmse"] * 1.5:
             raise RuntimeError(f"{name} NRMSE exceeds MUSA/CPU baseline")
 
     relative_gate(
         "energy_manual_cpu",
         energy_manual_cpu_a,
         energy_musa_cpu_a,
-        5e-3,
-        5e-5,
     )
     relative_gate(
         "force_manual_cpu",
         force_manual_cpu_a,
         force_musa_cpu_a,
-        0.5,
-        5e-3,
     )
     relative_gate(
         "virial_manual_cpu",
         virial_manual_cpu_a,
         virial_musa_cpu_a,
-        3.0,
-        2e-4,
+    )
+    relative_gate(
+        "energy_manual_cpu_b", energy_manual_cpu_b, energy_musa_cpu_b
+    )
+    relative_gate(
+        "force_manual_cpu_b", force_manual_cpu_b, force_musa_cpu_b
+    )
+    relative_gate(
+        "virial_manual_cpu_b", virial_manual_cpu_b, virial_musa_cpu_b
     )
     print("manual_efv_gates", "PASS")
     print("MANUAL_EFV_REWIRE_PASS")
