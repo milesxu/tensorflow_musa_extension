@@ -19,6 +19,23 @@ bash standalone_graph_contention_run.sh \
   /data/mingxu/tmp/tf-musa-stage-graph-probe-20261027/graph-contention-standalone
 ```
 
+Optional stream-priority probe:
+
+```bash
+./graph_contention_repro --mode graph --noise-blocks 512 \
+  --noise-iterations 50000 --samples 50 --warmup 10 \
+  --victim-priority -1
+```
+
+The valid priority range is printed in `GRAPH_CONTENTION_REPRO`.
+
+On the tested S5000 stack, `--victim-priority -2` did not remove the
+long-tail spikes: with `noise_blocks=512`, the high-priority graph
+still had `4/50` samples over `2 ms` (p95 `15.97 ms`, max `17.09 ms`).
+This suggests priority does not preempt a background kernel that is
+already executing; report this as an observation, not yet a confirmed
+runtime mechanism.
+
 Expected output:
 
 ```text

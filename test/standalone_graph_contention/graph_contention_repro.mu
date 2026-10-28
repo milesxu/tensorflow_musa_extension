@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <climits>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -357,6 +358,7 @@ int main(int argc, char** argv) {
   const int noise_iterations = ParseInt(argc, argv, "--noise-iterations", 50000);
   const int samples = ParseInt(argc, argv, "--samples", 30);
   const int warmup = ParseInt(argc, argv, "--warmup", 10);
+  const int requested_priority = ParseInt(argc, argv, "--victim-priority", INT_MIN);
   if (mode != "graph" && mode != "direct") {
     std::fprintf(stderr, "mode must be graph or direct\n");
     return 2;
@@ -366,10 +368,21 @@ int main(int argc, char** argv) {
   Buffers buffers;
   AllocateBuffers(&buffers);
 
+  int least_priority = 0;
+  int greatest_priority = 0;
+  MUSA_REQUIRE(musaDeviceGetStreamPriorityRange(&least_priority,
+                                                &greatest_priority));
   musaStream_t victim_stream = nullptr;
   musaStream_t noise_stream = nullptr;
-  MUSA_REQUIRE(musaStreamCreate(&victim_stream));
+  if (requested_priority == INT_MIN) {
+    MUSA_REQUIRE(musaStreamCreate(&victim_stream));
+  } else {
+    MUSA_REQUIRE(musaStreamCreateWithPriority(
+        &victim_stream, musaStreamDefault, requested_priority));
+  }
   MUSA_REQUIRE(musaStreamCreate(&noise_stream));
+  int victim_priority = 0;
+  MUSA_REQUIRE(musaStreamGetPriority(victim_stream, &victim_priority));
 
   mublasHandle_t handle = nullptr;
   MUBLAS_REQUIRE(mublasCreate(&handle));
@@ -393,10 +406,12 @@ int main(int argc, char** argv) {
     MUSA_REQUIRE(musaGraphNodeGetType(node, &type));
     if (type == musaGraphNodeTypeKernel) ++kernel_count;
   }
-  std::fprintf(stderr,
-               "GRAPH_CONTENTION_REPRO mode=%s noise_blocks=%d nodes=%zu "
-               "kernels=%zu\n",
-               mode.c_str(), noise_blocks, node_count, kernel_count);
+  std::fprintf(
+      stderr,
+      "GRAPH_CONTENTION_REPRO mode=%s noise_blocks=%d nodes=%zu kernels=%zu "
+      "priority_range=[%d,%d] victim_priority=%d\n",
+      mode.c_str(), noise_blocks, node_count, kernel_count, least_priority,
+      greatest_priority, victim_priority);
 
   musaEvent_t start_event = nullptr;
   musaEvent_t end_event = nullptr;
