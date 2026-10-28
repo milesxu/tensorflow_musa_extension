@@ -9,6 +9,7 @@
 
 #include <cmath>
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <memory>
@@ -135,7 +136,37 @@ struct FullFittingCache {
   size_t transpose_kernel_count = 0;
   int64_t batch_size = 0;
   int launch_count = 0;
+  musaEvent_t phase_start = nullptr;
+  musaEvent_t phase_after_x = nullptr;
+  musaEvent_t phase_after_weights = nullptr;
+  musaEvent_t phase_after_graph = nullptr;
+  musaEvent_t phase_end = nullptr;
 };
+
+Status EnsurePhaseEvents(FullFittingCache* cache) {
+  auto ensure = [](musaEvent_t* event, const char* name) -> Status {
+    if (*event != nullptr) return OkStatus();
+    const musaError_t status = musaEventCreate(event);
+    if (status != musaSuccess) {
+      return errors::Internal(name, " failed with MUSA error ",
+                              static_cast<int>(status));
+    }
+    return OkStatus();
+  };
+  Status status = ensure(&cache->phase_start, "musaEventCreate(phase_start)");
+  if (!status.ok()) return status;
+  status = ensure(&cache->phase_after_x, "musaEventCreate(phase_after_x)");
+  if (!status.ok()) return status;
+  status =
+      ensure(&cache->phase_after_weights,
+             "musaEventCreate(phase_after_weights)");
+  if (!status.ok()) return status;
+  status =
+      ensure(&cache->phase_after_graph,
+             "musaEventCreate(phase_after_graph)");
+  if (!status.ok()) return status;
+  return ensure(&cache->phase_end, "musaEventCreate(phase_end)");
+}
 
 void CleanupCache(FullFittingCache* cache) {
   if (cache == nullptr) return;
@@ -169,6 +200,22 @@ void CleanupCache(FullFittingCache* cache) {
       return;
     }
   }
+  auto destroy_event = [](musaEvent_t* event) {
+    if (*event != nullptr) {
+      const musaError_t destroy_status = musaEventDestroy(*event);
+      if (destroy_status != musaSuccess) {
+        std::fprintf(stderr,
+                     "FULL_FITTING_CLEANUP event destroy failed err=%d\n",
+                     static_cast<int>(destroy_status));
+      }
+      *event = nullptr;
+    }
+  };
+  destroy_event(&cache->phase_start);
+  destroy_event(&cache->phase_after_x);
+  destroy_event(&cache->phase_after_weights);
+  destroy_event(&cache->phase_after_graph);
+  destroy_event(&cache->phase_end);
   if (cache->exec != nullptr) {
     const musaError_t destroy_status = musaGraphExecDestroy(cache->exec);
     if (destroy_status != musaSuccess) {
@@ -322,6 +369,22 @@ class MusaManualGraphFullFittingOp : public OpKernel {
     const bool poison_hits =
         std::getenv("MUSA_FITTING_POISON_HITS") != nullptr;
     const bool cache_miss = cache_ == nullptr;
+    const bool phase_timing =
+        !cache_miss && !debug_sync && !poison_hits &&
+        std::getenv("MUSA_FITTING_PHASE_TIMING") != nullptr;
+    const bool hit_no_graph =
+        !cache_miss && std::getenv("MUSA_FITTING_HIT_NO_GRAPH") != nullptr;
+    using Clock = std::chrono::steady_clock;
+    Clock::time_point phase_host_start;
+    Clock::time_point phase_host_after_x;
+    Clock::time_point phase_host_after_weights;
+    Clock::time_point phase_host_before_launch;
+    Clock::time_point phase_host_after_launch;
+    Clock::time_point phase_host_before_outputs;
+    Clock::time_point phase_host_after_outputs;
+    Clock::time_point phase_host_after_sync;
+    Clock::time_point phase_host_before_log;
+    Clock::time_point phase_host_after_log;
     std::unique_ptr<FullFittingCache> pending_cache;
     FullFittingCache* cache = cache_.get();
     if (cache == nullptr) {
@@ -475,8 +538,22 @@ class MusaManualGraphFullFittingOp : public OpKernel {
                           musaMemcpyDeviceToDevice, stream),
           name);
     };
+    if (phase_timing) {
+      status = EnsurePhaseEvents(cache);
+      if (!status.ok()) return fail(status);
+      phase_host_start = Clock::now();
+      status = CheckMusa(musaEventRecord(cache->phase_start, stream),
+                         "musaEventRecord(phase_start)");
+      if (!status.ok()) return fail(status);
+    }
     status = copy_input(x_dev, x, "copy(x)");
     if (!status.ok()) return fail(status);
+    if (phase_timing) {
+      phase_host_after_x = Clock::now();
+      status = CheckMusa(musaEventRecord(cache->phase_after_x, stream),
+                         "musaEventRecord(phase_after_x)");
+      if (!status.ok()) return fail(status);
+    }
     status = copy_input(w0_dev, w0, "copy(w0)");
     if (!status.ok()) return fail(status);
     status = copy_input(b0_dev, b0, "copy(b0)");
@@ -497,6 +574,13 @@ class MusaManualGraphFullFittingOp : public OpKernel {
     if (!status.ok()) return fail(status);
     status = copy_input(idt2_dev, idt2, "copy(idt2)");
     if (!status.ok()) return fail(status);
+    if (phase_timing) {
+      phase_host_after_weights = Clock::now();
+      status = CheckMusa(
+          musaEventRecord(cache->phase_after_weights, stream),
+          "musaEventRecord(phase_after_weights)");
+      if (!status.ok()) return fail(status);
+    }
     if (cache_miss) {
       status = CheckMusa(musaStreamSynchronize(stream), "sync(inputs)");
       if (!status.ok()) return fail(status);
@@ -934,8 +1018,20 @@ class MusaManualGraphFullFittingOp : public OpKernel {
           poison_hit(grad_x_dev, kGradElements, "poison_hit(grad_x)");
       if (!poison_status.ok()) return fail(poison_status);
     }
-    status = CheckMusa(musaGraphLaunch(exec, stream), "musaGraphLaunch");
+    if (phase_timing) phase_host_before_launch = Clock::now();
+    if (hit_no_graph) {
+      status = run_sequence();
+    } else {
+      status = CheckMusa(musaGraphLaunch(exec, stream), "musaGraphLaunch");
+    }
     if (!status.ok()) return fail(status);
+    if (phase_timing) {
+      phase_host_after_launch = Clock::now();
+      status = CheckMusa(
+          musaEventRecord(cache->phase_after_graph, stream),
+          "musaEventRecord(phase_after_graph)");
+      if (!status.ok()) return fail(status);
+    }
     if (cache_miss) {
       status = CheckMusa(
           musaStreamSynchronize(stream), "sync(first_graph_launch)");
@@ -1030,6 +1126,7 @@ class MusaManualGraphFullFittingOp : public OpKernel {
       status = dump_buffer("energy", final_dev, kM);
       if (!status.ok()) return fail(status);
     }
+    if (phase_timing) phase_host_before_outputs = Clock::now();
     status = CheckMusa(
         musaMemcpyAsync(output->flat<float>().data(), final_dev,
                         sizeof(float) * kM, musaMemcpyDeviceToDevice,
@@ -1042,19 +1139,30 @@ class MusaManualGraphFullFittingOp : public OpKernel {
                         musaMemcpyDeviceToDevice, stream),
         "copy(grad_x)");
     if (!status.ok()) return fail(status);
+    if (phase_timing) {
+      phase_host_after_outputs = Clock::now();
+      status = CheckMusa(musaEventRecord(cache->phase_end, stream),
+                         "musaEventRecord(phase_end)");
+      if (!status.ok()) return fail(status);
+      status = CheckMusa(musaEventSynchronize(cache->phase_end),
+                         "musaEventSynchronize(phase_end)");
+      if (!status.ok()) return fail(status);
+      phase_host_after_sync = Clock::now();
+    }
     if (!cache_miss && debug_sync) {
       status = CheckMusa(
           musaStreamSynchronize(stream), "sync(debug_outputs)");
       if (!status.ok()) return fail(status);
     }
     ++cache->launch_count;
+    if (phase_timing) phase_host_before_log = Clock::now();
     std::fprintf(stderr,
                  "FULL_FITTING_CACHE %s=1 exec_launch=%d nodes=%zu kernels=%zu "
                  "mublas=%zu bias_tanh=%zu bias=%zu residual=%zu "
                  "backward_h2=%zu add_vector=%zu add_matrix=%zu "
                  "backward_h1=%zu backward_h0=%zu "
                  "poisoned_init=%d poisoned_hit=%d "
-                 "energy_shape=%dx1 grad_shape=1x%dx%d\n",
+                 "energy_shape=%dx1 grad_shape=1x%dx%d hit_no_graph=%d\n",
                  cache_miss ? "miss" : "hit", cache->launch_count,
                  cache->node_count, cache->kernel_count,
                  cache->mublas_kernel_count, cache->bias_tanh_kernel_count,
@@ -1064,7 +1172,65 @@ class MusaManualGraphFullFittingOp : public OpKernel {
                  cache->add_matrix_kernel_count,
                  cache->backward_h1_kernel_count,
                  cache->backward_h0_kernel_count, cache_miss ? 1 : 0,
-                 poison_hits ? 1 : 0, kM, kM, kK);
+                 poison_hits ? 1 : 0, kM, kM, kK, hit_no_graph ? 1 : 0);
+    if (phase_timing) {
+      phase_host_after_log = Clock::now();
+      auto elapsed_us = [](const Clock::time_point& begin,
+                           const Clock::time_point& end) {
+        return std::chrono::duration<double, std::micro>(end - begin).count();
+      };
+      float x_device_ms = 0.0f;
+      float weights_device_ms = 0.0f;
+      float graph_device_ms = 0.0f;
+      float output_device_ms = 0.0f;
+      float total_device_ms = 0.0f;
+      status = CheckMusa(
+          musaEventElapsedTime(&x_device_ms, cache->phase_start,
+                               cache->phase_after_x),
+          "musaEventElapsedTime(phase_x)");
+      if (!status.ok()) return fail(status);
+      status = CheckMusa(
+          musaEventElapsedTime(&weights_device_ms, cache->phase_after_x,
+                               cache->phase_after_weights),
+          "musaEventElapsedTime(phase_weights)");
+      if (!status.ok()) return fail(status);
+      status = CheckMusa(
+          musaEventElapsedTime(&graph_device_ms, cache->phase_after_weights,
+                               cache->phase_after_graph),
+          "musaEventElapsedTime(phase_graph)");
+      if (!status.ok()) return fail(status);
+      status = CheckMusa(
+          musaEventElapsedTime(&output_device_ms, cache->phase_after_graph,
+                               cache->phase_end),
+          "musaEventElapsedTime(phase_output)");
+      if (!status.ok()) return fail(status);
+      status = CheckMusa(
+          musaEventElapsedTime(&total_device_ms, cache->phase_start,
+                               cache->phase_end),
+          "musaEventElapsedTime(phase_total)");
+      if (!status.ok()) return fail(status);
+      std::fprintf(
+          stderr,
+          "FULL_FITTING_PHASE hit=%d x_host_us=%.3f "
+          "weights_host_us=%.3f graph_launch_host_us=%.3f "
+          "output_host_us=%.3f end_sync_host_us=%.3f log_host_us=%.3f "
+          "compute_host_us=%.3f x_device_us=%.3f weights_device_us=%.3f "
+          "graph_device_us=%.3f output_device_us=%.3f "
+          "total_device_us=%.3f\n",
+          cache->launch_count,
+          elapsed_us(phase_host_start, phase_host_after_x),
+          elapsed_us(phase_host_after_x, phase_host_after_weights),
+          elapsed_us(phase_host_before_launch, phase_host_after_launch),
+          elapsed_us(phase_host_before_outputs, phase_host_after_outputs),
+          elapsed_us(phase_host_after_outputs, phase_host_after_sync),
+          elapsed_us(phase_host_before_log, phase_host_after_log),
+          elapsed_us(phase_host_start, phase_host_after_sync),
+          static_cast<double>(x_device_ms) * 1000.0,
+          static_cast<double>(weights_device_ms) * 1000.0,
+          static_cast<double>(graph_device_ms) * 1000.0,
+          static_cast<double>(output_device_ms) * 1000.0,
+          static_cast<double>(total_device_ms) * 1000.0);
+    }
   }
 
  private:
