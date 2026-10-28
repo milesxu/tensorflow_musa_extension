@@ -9,10 +9,10 @@ CPU_OP_LIB = fitting.CPU_OP_LIB
 MUSA_OP_LIB = fitting.MUSA_OP_LIB
 
 
-def make_arrays(seed=1234):
+def make_arrays(seed=1234, batch=1536):
     rng = np.random.default_rng(seed)
     return [
-        (rng.normal(size=(1536, 1600)) * 0.01).astype(np.float32),
+        (rng.normal(size=(batch, 1600)) * 0.01).astype(np.float32),
         (rng.normal(size=(1600, 240)) * 0.02).astype(np.float32),
         (rng.normal(size=240) * 0.01).astype(np.float32),
         (rng.normal(size=(240, 240)) * 0.02).astype(np.float32),
@@ -53,40 +53,41 @@ def main():
     tf.load_op_library(CPU_OP_LIB)
     tf.load_op_library(MUSA_OP_LIB)
     ops = tensorflow_musa.get_musa_ops()
-    arrays = make_arrays()
-    cpu_energy = fitting.numpy_fitting_reference(arrays)
-    cpu_grad = fitting.numpy_fitting_gradient(arrays)
+    for batch in (512, 1536):
+        arrays = make_arrays(batch=batch)
+        cpu_energy = fitting.numpy_fitting_reference(arrays)
+        cpu_grad = fitting.numpy_fitting_gradient(arrays)
 
-    graph = tf.Graph()
-    with graph.as_default():
-        placeholders = [
-            tf.compat.v1.placeholder(tf.float32, shape=array.shape)
-            for array in arrays
-        ]
-        actual = ops.musa_manual_graph_full_fitting(*placeholders)
+        graph = tf.Graph()
+        with graph.as_default():
+            placeholders = [
+                tf.compat.v1.placeholder(tf.float32, shape=array.shape)
+                for array in arrays
+            ]
+            actual = ops.musa_manual_graph_full_fitting(*placeholders)
 
-    with tf.compat.v1.Session(graph=graph) as sess:
-        energy_miss, grad_miss = sess.run(
-            actual, feed_dict=dict(zip(placeholders, arrays))
+        with tf.compat.v1.Session(graph=graph) as sess:
+            energy_miss, grad_miss = sess.run(
+                actual, feed_dict=dict(zip(placeholders, arrays))
+            )
+            energy_hit, grad_hit = sess.run(
+                actual, feed_dict=dict(zip(placeholders, arrays))
+            )
+
+        check(
+            f"batch{batch}_miss",
+            energy_miss,
+            grad_miss,
+            cpu_energy,
+            cpu_grad,
         )
-        energy_hit, grad_hit = sess.run(
-            actual, feed_dict=dict(zip(placeholders, arrays))
+        check(
+            f"batch{batch}_hit",
+            energy_hit,
+            grad_hit,
+            cpu_energy,
+            cpu_grad,
         )
-
-    check(
-        "miss",
-        energy_miss,
-        grad_miss,
-        cpu_energy,
-        cpu_grad,
-    )
-    check(
-        "hit",
-        energy_hit,
-        grad_hit,
-        cpu_energy,
-        cpu_grad,
-    )
     print("MANUAL_BACKWARD_LAYOUT_PASS")
 
 

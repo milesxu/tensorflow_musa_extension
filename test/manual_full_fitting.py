@@ -84,7 +84,8 @@ def numpy_fitting_intermediates(arrays):
 
 
 def numpy_fitting_gradient(arrays):
-    return numpy_fitting_intermediates(arrays)["gx"].reshape(1, NLOC, 1600)
+    batch = arrays[0].shape[0]
+    return numpy_fitting_intermediates(arrays)["gx"].reshape(1, batch, 1600)
 
 
 def diff_stats(label, actual, expected):

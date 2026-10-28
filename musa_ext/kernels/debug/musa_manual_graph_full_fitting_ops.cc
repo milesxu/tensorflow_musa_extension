@@ -133,6 +133,7 @@ struct FullFittingCache {
   size_t backward_h1_kernel_count = 0;
   size_t backward_h0_kernel_count = 0;
   size_t transpose_kernel_count = 0;
+  int64_t batch_size = 0;
   int launch_count = 0;
 };
 
@@ -272,8 +273,24 @@ class MusaManualGraphFullFittingOp : public OpKernel {
             bf.dtype() == DT_FLOAT && idt1.dtype() == DT_FLOAT &&
             idt2.dtype() == DT_FLOAT,
         errors::InvalidArgument("full fitting inputs must be float"));
+    OP_REQUIRES(ctx, x.dims() == 2,
+                errors::InvalidArgument(
+                    "x rank mismatch: actual=", x.shape().DebugString()));
+    OP_REQUIRES(ctx, x.dim_size(1) == kK,
+                errors::InvalidArgument(
+                    "x second dimension mismatch: actual=",
+                    x.shape().DebugString()));
+    const int64_t batch_size = x.dim_size(0);
+    OP_REQUIRES(ctx, batch_size > 0 && batch_size <= INT_MAX,
+                errors::InvalidArgument(
+                    "invalid batch size: ", batch_size));
+    const int kM = static_cast<int>(batch_size);
+    const int kActive = kM * kH;
+    const int kGradElements = kM * kK;
     OP_REQUIRES(ctx, x.shape() == TensorShape({kM, kK}),
-                errors::InvalidArgument("x shape mismatch"));
+                errors::InvalidArgument(
+                    "x shape mismatch: actual=", x.shape().DebugString(),
+                    " expected=", TensorShape({kM, kK}).DebugString()));
     OP_REQUIRES(ctx, w0.shape() == TensorShape({kK, kH}) &&
                          b0.shape() == TensorShape({kH}),
                 errors::InvalidArgument("layer0 shape mismatch"));
@@ -313,12 +330,15 @@ class MusaManualGraphFullFittingOp : public OpKernel {
     } else {
       OP_REQUIRES(
           ctx,
-          cache->stream == stream && cache->device_id == device_id,
+          cache->stream == stream && cache->device_id == device_id &&
+              cache->batch_size == batch_size,
           errors::Internal(
-              "full fitting cache stream/device mismatch; refusing reuse"));
+              "full fitting cache stream/device/batch mismatch; refusing "
+              "reuse"));
     }
     cache->stream = stream;
     cache->device_id = device_id;
+    cache->batch_size = batch_size;
     mublasHandle_t& handle = cache->handle;
     musaGraph_t& graph = cache->graph;
     musaGraphExec_t& exec = cache->exec;
@@ -1070,8 +1090,13 @@ REGISTER_OP("MusaManualGraphFullFitting")
     .Output("grad_x: float")
     .SetIsStateful()
     .SetShapeFn([](shape_inference::InferenceContext* c) {
-      c->set_output(0, c->MakeShape({kM, 1}));
-      c->set_output(1, c->MakeShape({1, kM, kK}));
+      const shape_inference::ShapeHandle x = c->input(0);
+      shape_inference::DimensionHandle batch = c->UnknownDim();
+      if (c->RankKnown(x) && c->Rank(x) == 2) {
+        batch = c->Dim(x, 0);
+      }
+      c->set_output(0, c->MakeShape({batch, 1}));
+      c->set_output(1, c->MakeShape({1, batch, kK}));
       return OkStatus();
     });
 
