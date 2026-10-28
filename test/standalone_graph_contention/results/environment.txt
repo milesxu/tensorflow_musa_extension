@@ -1,0 +1,62 @@
+date=2026-10-28T11:42:16+08:00
+host=worker32008
+kernel=5.15.0-105-generic
+cpu_threads=128
+clang version 14.0.0 (git@sh-code.mthreads.com:sw/mtcc.git 46ca6e73b71f93bd150d786ed91ffdb3b225be04)
+mcc version 5.3.0
+Target: x86_64-unknown-linux-gnu
+Thread model: posix
+musa_toolkits:
+{
+	"version":	"5.3.0",
+	"git branch":	"release_musa_5.3.0",
+	"git tag":	"No tag",
+	"commit id":	"eb09b6f904378243b375cc55c53fea50bd25f1ed",
+	"commit date":	"2026-09-17 23:04:01 +0800"
+}
+Wed Oct 28 11:42:16 2026
+---------------------------------------------------------------------
+    mthreads-gmi:2.5.0           Driver Version:5.3.0-server
+---------------------------------------------------------------------
+ID   Name                 |PCIe                |%GPU  Mem             
+     Device Type   Perf   |Pcie Lane Width     |Temp  MPC Capable     
+                                               |      ECC Mode        
++-------------------------------------------------------------------+
+0    MTT S5000            |00000000:18:00.0    |0%    0MiB(81920MiB)
+     Physical      N/A    |16x(16x)            |65C   YES             
+                                               |      On-die, EDC     
++-------------------------------------------------------------------+
+1    MTT S5000            |00000000:3a:00.0    |0%    0MiB(81920MiB)
+     Physical      N/A    |16x(16x)            |51C   YES             
+                                               |      On-die, EDC     
++-------------------------------------------------------------------+
+2    MTT S5000            |00000000:4b:00.0    |0%    0MiB(81920MiB)
+     Physical      N/A    |16x(16x)            |64C   YES             
+                                               |      On-die, EDC     
++-------------------------------------------------------------------+
+3    MTT S5000            |00000000:5c:00.0    |0%    0MiB(81920MiB)
+     Physical      N/A    |16x(16x)            |51C   YES             
+                                               |      On-die, EDC     
++-------------------------------------------------------------------+
+4    MTT S5000            |00000000:9a:00.0    |0%    0MiB(81920MiB)
+     Physical      N/A    |16x(16x)            |65C   YES             
+                                               |      On-die, EDC     
++-------------------------------------------------------------------+
+5    MTT S5000            |00000000:ba:00.0    |0%    109MiB(81920MiB)
+     Physical      N/A    |16x(16x)            |50C   YES             
+                                               |      On-die, EDC     
++-------------------------------------------------------------------+
+6    MTT S5000            |00000000:ca:00.0    |0%    0MiB(81920MiB)
+     Physical      N/A    |16x(16x)            |64C   YES             
+                                               |      On-die, EDC     
++-------------------------------------------------------------------+
+7    MTT S5000            |00000000:da:00.0    |0%    0MiB(81920MiB)
+     Physical      N/A    |16x(16x)            |52C   YES             
+                                               |      On-die, EDC     
+---------------------------------------------------------------------
+
+---------------------------------------------------------------------
+Processes:
+ID   PID           Process name                           GPU Memory
+                                                               Usage
+e97a860407810d9f96752686d8524267f51d0bd628fdcb56621e2ccf6f87239c  /data/mingxu/tmp/tf-musa-stage-graph-probe-20261027/graph-contention-standalone/graph_contention_repro
