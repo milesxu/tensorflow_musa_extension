@@ -115,6 +115,54 @@ def load_graph_def(with_manual_gradient):
     ]:
         node = by_name[name]
         print("manual_graph_node", name, node.op, list(node.input))
+    def collect_ancestors(roots):
+        ancestors = set()
+        stack = list(roots)
+        while stack:
+            name = stack.pop().split(":")[0]
+            if name.startswith("^"):
+                name = name[1:]
+            if name in ancestors or name not in by_name:
+                continue
+            ancestors.add(name)
+            stack.extend(by_name[name].input)
+        return ancestors
+
+    energy_ancestors = collect_ancestors(["o_energy"])
+    force_ancestors = collect_ancestors(["o_force"])
+    virial_ancestors = collect_ancestors(["o_virial"])
+    for label, ancestors in [
+        ("energy", energy_ancestors),
+        ("force", force_ancestors),
+        ("virial", virial_ancestors),
+    ]:
+        if MANUAL_NODE not in ancestors:
+            raise RuntimeError(f"manual node absent from {label} ancestors")
+    if "Cast_7" not in energy_ancestors:
+        raise RuntimeError("Cast_7 absent from energy ancestors")
+    for label, ancestors in [
+        ("force", force_ancestors),
+        ("virial", virial_ancestors),
+    ]:
+        if "gradients/Slice_3_grad/Pad" not in ancestors:
+            raise RuntimeError(f"gradient Pad absent from {label} ancestors")
+    if "Reshape_24" not in force_ancestors:
+        raise RuntimeError("Reshape_24 absent from force ancestors")
+    if "ProdForceSeA" not in force_ancestors:
+        raise RuntimeError("ProdForceSeA absent from force ancestors")
+    if "ProdVirialSeA" not in virial_ancestors:
+        raise RuntimeError("ProdVirialSeA absent from virial ancestors")
+    if "Reshape_24" not in virial_ancestors:
+        raise RuntimeError("Reshape_24 absent from virial ancestors")
+    stale_in_ancestors = sorted(
+        stale & (energy_ancestors | force_ancestors | virial_ancestors)
+    )
+    if stale_in_ancestors:
+        raise RuntimeError(f"stale nodes in EFV ancestry: {stale_in_ancestors}")
+    print("ancestor_energy_count", len(energy_ancestors))
+    print("ancestor_force_count", len(force_ancestors))
+    print("ancestor_virial_count", len(virial_ancestors))
+    print("ancestor_stale_type0_nodes", 0)
     print("manual_pruned_nodes", len(pruned.node))
     print("manual_stale_type0_nodes", 0)
 
@@ -239,6 +287,8 @@ def main():
         print(f"manual_{name}_input_delta_max_abs", input_delta)
         if repeat_12 > 1e-10 or repeat_23 > 1e-10:
             raise RuntimeError(f"manual {name} repeat drift exceeds gate")
+        if name == "energy" and (repeat_12 != 0.0 or repeat_23 != 0.0):
+            raise RuntimeError("manual energy repeat is not bitwise")
         if name == "energy" and input_delta <= 1.0:
             raise RuntimeError("manual energy did not react to input B")
         if name in ("force", "virial") and input_delta <= 1e-3:
