@@ -36,6 +36,27 @@ This suggests priority does not preempt a background kernel that is
 already executing; report this as an observation, not yet a confirmed
 runtime mechanism.
 
+## Tested result
+
+MTT S5000, MUSA 5.3.0, 50 samples per mode/noise pair, three final
+sweeps:
+
+| mode | noise blocks | median | p95 | spikes >2 ms |
+|---|---:|---:|---:|---:|
+| graph | 0 | 834-855 us | 879-899 us | 0/50 |
+| direct | 0 | 766-777 us | 814-820 us | 0/50 |
+| graph | 256 | 936 us | 997-998 us | 0/50 |
+| graph | 512 | 822-828 us | 15.92-16.02 ms | 4/50 |
+| graph | 1024 | 833-839 us | 16.43-16.49 ms | 8/50 |
+| direct | 512 | 746-749 us | 15.48-15.72 ms | 4/50 |
+| direct | 1024 | 753-761 us | 16.49-16.55 ms | 6-7/50 |
+
+The graph launch host cost is much lower (`~4 us` vs `~78-85 us`
+direct), but the device long tail is present in both modes. A
+high-priority victim stream (`-2`) still produced `4/50` spikes with
+`noise_blocks=512`; stream priority therefore does not remove the
+observed tail on this stack.
+
 Expected output:
 
 ```text

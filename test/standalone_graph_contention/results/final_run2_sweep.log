@@ -1,0 +1,10 @@
+SUMMARY mode=graph noise_blocks=0 samples=50 nodes=26 kernels=26 device_median_us=854.720 device_p95_us=899.320 device_p99_us=900.480 device_max_us=900.480 device_spikes_over_2ms=0 launch_median_us=3.963
+SUMMARY mode=graph noise_blocks=64 samples=50 nodes=26 kernels=26 device_median_us=842.040 device_p95_us=895.720 device_p99_us=916.480 device_max_us=916.480 device_spikes_over_2ms=0 launch_median_us=3.973
+SUMMARY mode=graph noise_blocks=256 samples=50 nodes=26 kernels=26 device_median_us=937.480 device_p95_us=997.200 device_p99_us=1005.000 device_max_us=1005.000 device_spikes_over_2ms=0 launch_median_us=4.090
+SUMMARY mode=graph noise_blocks=512 samples=50 nodes=26 kernels=26 device_median_us=821.800 device_p95_us=16016.399 device_p99_us=17488.159 device_max_us=17488.159 device_spikes_over_2ms=4 launch_median_us=4.044
+SUMMARY mode=graph noise_blocks=1024 samples=50 nodes=26 kernels=26 device_median_us=838.920 device_p95_us=16429.359 device_p99_us=18031.759 device_max_us=18031.759 device_spikes_over_2ms=8 launch_median_us=4.254
+SUMMARY mode=direct noise_blocks=0 samples=50 nodes=26 kernels=26 device_median_us=777.120 device_p95_us=820.480 device_p99_us=828.080 device_max_us=828.080 device_spikes_over_2ms=0 launch_median_us=81.923
+SUMMARY mode=direct noise_blocks=64 samples=50 nodes=26 kernels=26 device_median_us=765.240 device_p95_us=816.040 device_p99_us=828.880 device_max_us=828.880 device_spikes_over_2ms=0 launch_median_us=85.391
+SUMMARY mode=direct noise_blocks=256 samples=50 nodes=26 kernels=26 device_median_us=854.320 device_p95_us=882.360 device_p99_us=898.880 device_max_us=898.880 device_spikes_over_2ms=0 launch_median_us=85.141
+SUMMARY mode=direct noise_blocks=512 samples=50 nodes=26 kernels=26 device_median_us=748.640 device_p95_us=15485.800 device_p99_us=17496.361 device_max_us=17496.361 device_spikes_over_2ms=4 launch_median_us=83.386
+SUMMARY mode=direct noise_blocks=1024 samples=50 nodes=26 kernels=26 device_median_us=760.080 device_p95_us=16493.759 device_p99_us=18089.600 device_max_us=18089.600 device_spikes_over_2ms=7 launch_median_us=82.265
