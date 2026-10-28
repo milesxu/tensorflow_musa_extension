@@ -1,4 +1,7 @@
 #include "../utils_op.h"
+#include "../fusion/musa_bias_add_double.h"
+#include <cstdlib>
+#include <type_traits>
 #include "tensorflow/core/framework/op_kernel.h"
 #include "tensorflow/core/framework/register_types.h"
 #include "tensorflow/core/framework/tensor.h"
@@ -36,6 +39,26 @@ class MusaBiasAddOp : public MusaOpKernel {
 
     Tensor* output = nullptr;
     OP_REQUIRES_OK(ctx, ctx->allocate_output(0, input.shape(), &output));
+
+    if constexpr (std::is_same<T, double>::value) {
+      const bool custom_enabled =
+          std::getenv("TF_MUSA_DISABLE_DOUBLE_BIASADD_FASTPATH") == nullptr;
+      const bool layout_supported =
+          input.dims() == 2 || data_format_ == FORMAT_NHWC;
+      const int64_t cols = input.dim_size(input.dims() - 1);
+      if (custom_enabled && layout_supported && cols > 0) {
+        const int64_t rows = input.NumElements() / cols;
+        auto stream = GetMusaStreamByCtx(ctx);
+        const auto fast_status = LaunchMusaBiasAddDoubleRowMajorOut(
+            input.flat<double>().data(), bias.flat<double>().data(),
+            output->flat<double>().data(), rows, cols, stream);
+        OP_REQUIRES(
+            ctx, fast_status == musaSuccess,
+            errors::Internal("MUSA double BiasAdd fast path failed: ",
+                             static_cast<int>(fast_status)));
+        return;
+      }
+    }
 
     MUSA_OP_REQUIRES_MUDNN_HANDLE(ctx);
     auto& handle = GetHandleByCtx(ctx);
